@@ -6,6 +6,7 @@ import streamlit as st
 from database import (
     adicionar_excecao_agendamento,
     aniversariantes_do_dia,
+    atualizar_pago_agendamento,
     atualizar_status_agendamento,
     excluir_agendamento,
     listar_agendamentos,
@@ -145,6 +146,19 @@ def formulario_agendamento(dia_padrao: date) -> None:
             )
             valor = st.number_input("Valor cobrado", min_value=0.0, value=valor_default, step=5.0)
 
+            # Controle de Pagamento
+            pago_default = bool(editando["pago"]) if editando and editando.get("pago") else False
+            servico_pago = st.checkbox("Serviço Pago?", value=pago_default)
+            data_pagamento_input = None
+            if servico_pago:
+                dt_pag_default = dia
+                if editando and editando.get("data_pagamento"):
+                    try:
+                        dt_pag_default = datetime.strptime(editando["data_pagamento"][:10], "%Y-%m-%d").date()
+                    except ValueError:
+                        pass
+                data_pagamento_input = st.date_input("Data do pagamento", value=dt_pag_default, format="DD/MM/YYYY")
+
             # Opções de Recorrência
             st.markdown("---")
             repetir = st.checkbox("Repetir Evento", value=config_rrule["repetir"])
@@ -205,6 +219,8 @@ def formulario_agendamento(dia_padrao: date) -> None:
                 observacoes=observacoes,
                 rrule=rrule_str,
                 exdate=editando["exdate"] if editando else None,
+                pago=1 if servico_pago else 0,
+                data_pagamento=data_pagamento_input if servico_pago else None,
                 agendamento_id=editando["id"] if editando else None,
             )
             st.session_state.agendamento_edit_id = None
@@ -325,13 +341,26 @@ def render_dia(dia: date) -> None:
         with st.container(border=True):
             top, acoes = st.columns((3.5, 1.5))
             rotulo_recorrente = " 🔁 (Recorrente)" if item.get("rrule") else ""
+            if item.get("pago"):
+                dt_pag_str = item.get("data_pagamento")
+                if dt_pag_str:
+                    try:
+                        dt_fmt = datetime.strptime(dt_pag_str[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+                        indicador_pago = f"🟢 Pago ({dt_fmt})"
+                    except ValueError:
+                        indicador_pago = "🟢 Pago"
+                else:
+                    indicador_pago = "🟢 Pago"
+            else:
+                indicador_pago = "🔴 A Receber"
+
             top.markdown(
                 f"**{item['data_hora'][11:16]}** · {item['pet_nome']} "
                 f"({item['tutor_nome']}) · {item['servico_nome']}{rotulo_recorrente}"
             )
             top.caption(
                 f"Profissional: {item['profissional'] or '-'} · "
-                f"Status: {item['status']} · {formatar_moeda(item['valor_estimado'])}"
+                f"Status: {item['status']} · {formatar_moeda(item['valor_estimado'])} · {indicador_pago}"
             )
             if item["alergias_restricoes"] or item["temperamento"]:
                 top.caption(
@@ -349,6 +378,16 @@ def render_dia(dia: date) -> None:
             if item.get("rrule"):
                 if acoes.button("Remover desta data", key=f"rm_inst_{key_suffix}"):
                     adicionar_excecao_agendamento(item["id"], item["data_hora"])
+                    st.rerun()
+
+            if item.get("pago"):
+                if acoes.button("Marcar A Receber", key=f"pag_off_{key_suffix}"):
+                    atualizar_pago_agendamento(item["id"], pago=0)
+                    st.rerun()
+            else:
+                if acoes.button("Marcar Pago", key=f"pag_on_{key_suffix}"):
+                    data_pag_padrao = item["data_hora"][:10]
+                    atualizar_pago_agendamento(item["id"], pago=1, data_pagamento=data_pag_padrao)
                     st.rerun()
 
             novo_status = acoes.selectbox(

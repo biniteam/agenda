@@ -6,6 +6,7 @@ import pytest
 
 from database import (
     adicionar_excecao_agendamento,
+    atualizar_pago_agendamento,
     expandir_agendamentos,
     get_connection,
     init_db,
@@ -231,3 +232,52 @@ def test_crud_servicos():
     ok_del, msg_del = excluir_servico(s_padrao_id)
     assert ok_del is False
     assert "Não é possível excluir" in msg_del
+
+
+def test_controle_pagamento_e_sincronizacao_financeira():
+    """Testa as colunas 'pago' e 'data_pagamento' e a sincronização financeira."""
+    cid = salvar_cliente("Tutor Pagamento", "11977777777")
+    pid = salvar_pet(cid, "Pet Pagamento")
+    servicos = listar_servicos()
+    sid = servicos[0]["id"]
+
+    # 1. Agendamento criado como não pago (pago=0)
+    ag_id = salvar_agendamento(
+        pet_id=pid,
+        servico_id=sid,
+        data_hora=datetime(2025, 3, 10, 14, 0),
+        status="Concluído",
+        pago=0,
+    )
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM agendamentos WHERE id = ?", (ag_id,)).fetchone()
+        assert row["pago"] == 0
+        assert row["data_pagamento"] is None
+
+        fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = ?", (ag_id,)).fetchall()
+        assert len(fin) == 0
+
+    # 2. Atualizar agendamento para pago=1 com data_pagamento
+    dt_pag = date(2025, 3, 12)
+    atualizar_pago_agendamento(ag_id, pago=1, data_pagamento=dt_pag)
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM agendamentos WHERE id = ?", (ag_id,)).fetchone()
+        assert row["pago"] == 1
+        assert row["data_pagamento"] == "2025-03-12"
+
+        fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = ?", (ag_id,)).fetchall()
+        assert len(fin) == 1
+        assert fin[0]["tipo"] == "Receita"
+        assert fin[0]["data"] == "2025-03-12"
+
+    # 3. Alterar para pago=0 deve remover o lançamento do financeiro
+    atualizar_pago_agendamento(ag_id, pago=0)
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM agendamentos WHERE id = ?", (ag_id,)).fetchone()
+        assert row["pago"] == 0
+
+        fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = ?", (ag_id,)).fetchall()
+        assert len(fin) == 0
