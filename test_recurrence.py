@@ -191,3 +191,43 @@ def test_fluxo_banco_agendamento_recorrente():
     datas_pos = [a["data_hora"] for a in agendamentos_pos_ex]
     assert len(agendamentos_pos_ex) == 4
     assert "2025-03-10 09:00:00" not in datas_pos
+
+
+def test_crud_servicos():
+    """Testa adição, busca, edição e exclusão de serviços no banco."""
+    from database import (
+        excluir_servico,
+        obter_servico,
+        salvar_servico,
+    )
+
+    # Novo serviço
+    sid = salvar_servico("Hidratação Especial", 85.0, 45)
+    servico = obter_servico(sid)
+    assert servico is not None
+    assert servico["nome"] == "Hidratação Especial"
+    assert servico["preco_padrao"] == 85.0
+    assert servico["duracao_minutos"] == 45
+
+    # Editar serviço
+    salvar_servico("Hidratação Premium", 95.0, 50, servico_id=sid)
+    servico_editado = obter_servico(sid)
+    assert servico_editado["nome"] == "Hidratação Premium"
+    assert servico_editado["preco_padrao"] == 95.0
+    assert servico_editado["duracao_minutos"] == 50
+
+    # Tentar excluir serviço sem agendamentos
+    ok, msg = excluir_servico(sid)
+    assert ok is True
+    assert obter_servico(sid) is None
+
+    # Tentar excluir serviço com agendamentos vinculados
+    servicos_padrao = listar_servicos()
+    s_padrao_id = servicos_padrao[0]["id"]
+    cid = salvar_cliente("Tutor Servico Teste", "11888888888")
+    pid = salvar_pet(cid, "Pet Servico Teste")
+    salvar_agendamento(pid, s_padrao_id, datetime(2025, 3, 1, 10, 0))
+
+    ok_del, msg_del = excluir_servico(s_padrao_id)
+    assert ok_del is False
+    assert "Não é possível excluir" in msg_del

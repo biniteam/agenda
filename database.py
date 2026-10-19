@@ -375,6 +375,53 @@ def listar_servicos() -> list[dict[str, Any]]:
     return _as_dicts(rows)
 
 
+def obter_servico(servico_id: int) -> dict[str, Any] | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM servicos WHERE id = ?", (servico_id,)
+        ).fetchone()
+    return _as_dict(row) if row else None
+
+
+def salvar_servico(
+    nome: str,
+    preco_padrao: float,
+    duracao_minutos: int = 60,
+    servico_id: int | None = None,
+) -> int:
+    with get_connection() as conn:
+        if servico_id:
+            conn.execute(
+                """
+                UPDATE servicos
+                SET nome = ?, preco_padrao = ?, duracao_minutos = ?
+                WHERE id = ?
+                """,
+                (nome.strip(), float(preco_padrao), int(duracao_minutos), servico_id),
+            )
+            return servico_id
+        cursor = conn.execute(
+            """
+            INSERT INTO servicos (nome, preco_padrao, duracao_minutos)
+            VALUES (?, ?, ?)
+            """,
+            (nome.strip(), float(preco_padrao), int(duracao_minutos)),
+        )
+        return int(cursor.lastrowid)
+
+
+def excluir_servico(servico_id: int) -> tuple[bool, str]:
+    with get_connection() as conn:
+        qtd = conn.execute(
+            "SELECT COUNT(*) FROM agendamentos WHERE servico_id = ?", (servico_id,)
+        ).fetchone()[0]
+        if qtd > 0:
+            return False, f"Não é possível excluir: existem {qtd} agendamento(s) vinculado(s) a este serviço."
+        conn.execute("DELETE FROM servicos WHERE id = ?", (servico_id,))
+    return True, "Serviço excluído com sucesso."
+
+
+
 # --- Agendamentos e Recorrência ---
 
 
