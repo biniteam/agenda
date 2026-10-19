@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
+from dateutil.rrule import rrulestr
 
 TZ = ZoneInfo("America/Sao_Paulo")
 MESES = (
@@ -22,6 +23,7 @@ MESES = (
     "Dezembro",
 )
 DIAS_SEMANA = ("Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo")
+MAPA_DIAS_RRULE = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
 STATUS_AGENDAMENTO = ("Agendado", "Em Andamento", "Concluído", "Cancelado")
 PORTES = ("P", "M", "G")
 CATEGORIAS_RECEITA = ("Serviços", "Produtos", "Outros")
@@ -64,3 +66,42 @@ def link_whatsapp(telefone: str | None, mensagem: str) -> str | None:
     if len(digitos) in (10, 11):
         digitos = "55" + digitos
     return f"https://wa.me/{digitos}?text={quote(mensagem)}"
+
+
+def construir_rrule(frequencia: str, dias_semana_indices: list[int] | None = None) -> str | None:
+    """
+    Gera uma string RRULE válida com base nas opções da interface.
+    frequencia: 'Diário', 'Semanal', 'Mensal'
+    dias_semana_indices: lista de inteiros 0=Segunda, 1=Terça, ..., 6=Domingo
+    """
+    if frequencia == "Diário":
+        return "FREQ=DAILY"
+    elif frequencia == "Semanal":
+        if not dias_semana_indices:
+            return "FREQ=WEEKLY"
+        dias_str = ",".join(MAPA_DIAS_RRULE[i] for i in sorted(dias_semana_indices))
+        return f"FREQ=WEEKLY;BYDAY={dias_str}"
+    elif frequencia == "Mensal":
+        return "FREQ=MONTHLY"
+    return None
+
+
+def decodificar_rrule(rrule_str: str | None) -> dict:
+    """
+    Analisa uma string RRULE e retorna um dicionário com frequencia e dias da semana para pré-preencher o formulário.
+    """
+    if not rrule_str:
+        return {"repetir": False, "frequencia": "Diário", "dias_semana": []}
+
+    res = {"repetir": True, "frequencia": "Diário", "dias_semana": []}
+    try:
+        rule = rrulestr(rrule_str)
+        freq_map = {0: "Yearly", 1: "Mensal", 2: "Semanal", 3: "Diário"}
+        res["frequencia"] = freq_map.get(rule._freq, "Diário")
+
+        if rule._byweekday:
+            res["dias_semana"] = list(rule._byweekday)
+    except Exception:
+        pass
+
+    return res

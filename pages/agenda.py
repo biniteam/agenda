@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta
 import streamlit as st
 
 from database import (
+    adicionar_excecao_agendamento,
     aniversariantes_do_dia,
     atualizar_status_agendamento,
     excluir_agendamento,
@@ -17,6 +18,8 @@ from database import (
 from utils import (
     DIAS_SEMANA,
     STATUS_AGENDAMENTO,
+    construir_rrule,
+    decodificar_rrule,
     formatar_moeda,
     fim_semana,
     hoje,
@@ -103,7 +106,10 @@ def formulario_agendamento(dia_padrao: date) -> None:
     )
     valores_servico = {s["id"]: float(s["preco_padrao"]) for s in servicos}
 
-    titulo = "Editar agendamento" if editando else "Novo agendamento"
+    # Configurações de recorrência padrão
+    config_rrule = decodificar_rrule(editando["rrule"] if editando else None)
+
+    titulo = "Editar agendamento (Série)" if editando else "Novo agendamento"
     with st.expander(titulo, expanded=bool(editando)):
         with st.form("form_agendamento"):
             pet_id = st.selectbox(
@@ -125,7 +131,7 @@ def formulario_agendamento(dia_padrao: date) -> None:
                 ),
             )
             c1, c2, c3 = st.columns(3)
-            dia = c1.date_input("Data", value=data_valor, format="DD/MM/YYYY")
+            dia = c1.date_input("Data de início", value=data_valor, format="DD/MM/YYYY")
             hora = c2.time_input("Horário", value=hora_valor)
             status = c3.selectbox("Status", STATUS_AGENDAMENTO, index=status_index)
             profissional = st.text_input(
@@ -138,6 +144,40 @@ def formulario_agendamento(dia_padrao: date) -> None:
                 else valores_servico[servico_id]
             )
             valor = st.number_input("Valor cobrado", min_value=0.0, value=valor_default, step=5.0)
+
+            # Opções de Recorrência
+            st.markdown("---")
+            repetir = st.checkbox("Repetir Evento", value=config_rrule["repetir"])
+            rrule_str = None
+
+            if repetir:
+                col_freq, col_dias = st.columns((1, 2))
+                opcoes_freq = ("Diário", "Semanal", "Mensal")
+                freq_idx = (
+                    opcoes_freq.index(config_rrule["frequencia"])
+                    if config_rrule["frequencia"] in opcoes_freq
+                    else 0
+                )
+                frequencia = col_freq.selectbox("Frequência", opcoes_freq, index=freq_idx)
+
+                dias_selecionados_idx = []
+                if frequencia == "Semanal":
+                    dias_iniciais = (
+                        config_rrule["dias_semana"]
+                        if config_rrule["dias_semana"]
+                        else [dia.weekday()]
+                    )
+                    dias_selecionados_nomes = col_dias.multiselect(
+                        "Dias da semana",
+                        options=list(DIAS_SEMANA),
+                        default=[DIAS_SEMANA[idx] for idx in dias_iniciais if idx < len(DIAS_SEMANA)],
+                    )
+                    dias_selecionados_idx = [
+                        DIAS_SEMANA.index(nome) for nome in dias_selecionados_nomes
+                    ]
+
+                rrule_str = construir_rrule(frequencia, dias_selecionados_idx)
+
             observacoes = st.text_area(
                 "Observações de manejo / produtos aplicados",
                 value=editando["observacoes"] if editando else "",
@@ -145,7 +185,7 @@ def formulario_agendamento(dia_padrao: date) -> None:
             col_a, col_b, col_c = st.columns(3)
             salvar = col_a.form_submit_button("Salvar", type="primary")
             cancelar = col_b.form_submit_button("Cancelar edição") if editando else False
-            excluir = col_c.form_submit_button("Excluir") if editando else False
+            excluir = col_c.form_submit_button("Excluir série") if editando else False
 
         if cancelar:
             st.session_state.agendamento_edit_id = None
@@ -163,6 +203,8 @@ def formulario_agendamento(dia_padrao: date) -> None:
                 profissional=profissional,
                 valor_cobrado=valor,
                 observacoes=observacoes,
+                rrule=rrule_str,
+                exdate=editando["exdate"] if editando else None,
                 agendamento_id=editando["id"] if editando else None,
             )
             st.session_state.agendamento_edit_id = None
@@ -240,8 +282,9 @@ def render_semana(dia: date) -> None:
                 st.write("—")
             for item in lista:
                 hora = item["data_hora"][11:16]
+                badge_recorrente = " 🔁" if item.get("rrule") else ""
                 st.markdown(
-                    f"{hora} **{item['pet_nome']}**<br>"
+                    f"{hora}{badge_recorrente} **{item['pet_nome']}**<br>"
                     f"<small>{item['servico_nome']} · {item['status']}</small>",
                     unsafe_allow_html=True,
                 )
@@ -278,12 +321,13 @@ def render_dia(dia: date) -> None:
     st.subheader("Serviços do dia")
     if not itens:
         st.info("Nenhum agendamento neste dia.")
-    for item in itens:
+    for idx, item in enumerate(itens):
         with st.container(border=True):
-            top, acoes = st.columns((4, 1))
+            top, acoes = st.columns((3.5, 1.5))
+            rotulo_recorrente = " 🔁 (Recorrente)" if item.get("rrule") else ""
             top.markdown(
                 f"**{item['data_hora'][11:16]}** · {item['pet_nome']} "
-                f"({item['tutor_nome']}) · {item['servico_nome']}"
+                f"({item['tutor_nome']}) · {item['servico_nome']}{rotulo_recorrente}"
             )
             top.caption(
                 f"Profissional: {item['profissional'] or '-'} · "
@@ -296,14 +340,22 @@ def render_dia(dia: date) -> None:
                 )
             if item["observacoes"]:
                 top.write(item["observacoes"])
-            if acoes.button("Editar", key=f"ed_ag_{item['id']}"):
+
+            key_suffix = f"{item['id']}_{idx}_{item['data_hora'][:10]}"
+            if acoes.button("Editar Série", key=f"ed_ag_{key_suffix}"):
                 st.session_state.agendamento_edit_id = item["id"]
                 st.rerun()
+
+            if item.get("rrule"):
+                if acoes.button("Remover desta data", key=f"rm_inst_{key_suffix}"):
+                    adicionar_excecao_agendamento(item["id"], item["data_hora"])
+                    st.rerun()
+
             novo_status = acoes.selectbox(
                 "Status",
                 STATUS_AGENDAMENTO,
                 index=STATUS_AGENDAMENTO.index(item["status"]),
-                key=f"st_ag_{item['id']}",
+                key=f"st_ag_{key_suffix}",
                 label_visibility="collapsed",
             )
             if novo_status != item["status"]:
