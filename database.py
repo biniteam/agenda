@@ -30,6 +30,8 @@ AGENDAMENTO_SELECT = """
         a.observacoes,
         a.rrule,
         a.exdate,
+        a.pago,
+        a.data_pagamento,
         p.nome AS pet_nome,
         p.temperamento,
         p.alergias_restricoes,
@@ -101,6 +103,8 @@ def init_db() -> None:
                 observacoes TEXT,
                 rrule TEXT DEFAULT NULL,
                 exdate TEXT DEFAULT NULL,
+                pago INTEGER NOT NULL DEFAULT 0,
+                data_pagamento TEXT DEFAULT NULL,
                 FOREIGN KEY (pet_id) REFERENCES pets(id),
                 FOREIGN KEY (servico_id) REFERENCES servicos(id)
             );
@@ -128,6 +132,10 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE agendamentos ADD COLUMN rrule TEXT DEFAULT NULL")
     if "exdate" not in columns:
         conn.execute("ALTER TABLE agendamentos ADD COLUMN exdate TEXT DEFAULT NULL")
+    if "pago" not in columns:
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN pago INTEGER NOT NULL DEFAULT 0")
+    if "data_pagamento" not in columns:
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN data_pagamento TEXT DEFAULT NULL")
 
 
 def _seed_servicos(conn: sqlite3.Connection) -> None:
@@ -531,11 +539,15 @@ def salvar_agendamento(
     observacoes: str = "",
     rrule: str | None = None,
     exdate: str | None = None,
+    pago: int = 0,
+    data_pagamento: date | str | None = None,
     agendamento_id: int | None = None,
 ) -> int:
     instante = _iso_datetime(data_hora)
     rrule_val = rrule.strip() if rrule and rrule.strip() else None
     exdate_val = exdate.strip() if exdate and exdate.strip() else None
+    pago_val = int(pago)
+    data_pagamento_val = _iso_date(data_pagamento) if data_pagamento else None
 
     with get_connection() as conn:
         if agendamento_id:
@@ -544,7 +556,7 @@ def salvar_agendamento(
                 UPDATE agendamentos
                 SET pet_id = ?, servico_id = ?, data_hora = ?, status = ?,
                     profissional = ?, valor_cobrado = ?, observacoes = ?,
-                    rrule = ?, exdate = ?
+                    rrule = ?, exdate = ?, pago = ?, data_pagamento = ?
                 WHERE id = ?
                 """,
                 (
@@ -557,6 +569,8 @@ def salvar_agendamento(
                     observacoes.strip(),
                     rrule_val,
                     exdate_val,
+                    pago_val,
+                    data_pagamento_val,
                     agendamento_id,
                 ),
             )
@@ -566,8 +580,8 @@ def salvar_agendamento(
                 """
                 INSERT INTO agendamentos (
                     pet_id, servico_id, data_hora, status, profissional,
-                    valor_cobrado, observacoes, rrule, exdate
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    valor_cobrado, observacoes, rrule, exdate, pago, data_pagamento
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pet_id,
@@ -579,6 +593,8 @@ def salvar_agendamento(
                     observacoes.strip(),
                     rrule_val,
                     exdate_val,
+                    pago_val,
+                    data_pagamento_val,
                 ),
             )
             novo_id = int(cursor.lastrowid)
@@ -615,6 +631,26 @@ def atualizar_status_agendamento(agendamento_id: int, status: str) -> None:
     _sincronizar_receita_agendamento(agendamento_id)
 
 
+def atualizar_pago_agendamento(
+    agendamento_id: int,
+    pago: int,
+    data_pagamento: date | str | None = None,
+) -> None:
+    pago_val = int(pago)
+    data_pag_val = _iso_date(data_pagamento) if data_pagamento else None
+    if pago_val == 1 and not data_pag_val:
+        ag = obter_agendamento(agendamento_id)
+        if ag:
+            data_pag_val = ag.get("data_pagamento") or ag["data_hora"][:10]
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE agendamentos SET pago = ?, data_pagamento = ? WHERE id = ?",
+            (pago_val, data_pag_val, agendamento_id),
+        )
+    _sincronizar_receita_agendamento(agendamento_id)
+
+
 def excluir_agendamento(agendamento_id: int) -> None:
     with get_connection() as conn:
         conn.execute(
@@ -632,12 +668,12 @@ def _sincronizar_receita_agendamento(agendamento_id: int) -> None:
             "SELECT id FROM financeiro WHERE agendamento_id = ? AND tipo = 'Receita'",
             (agendamento_id,),
         ).fetchone()
-        if agendamento["status"] != "Concluído":
+        if not agendamento.get("pago"):
             if existente:
                 conn.execute("DELETE FROM financeiro WHERE id = ?", (existente["id"],))
             return
         valor = float(agendamento["valor_estimado"] or 0)
-        dia = agendamento["data_hora"][:10]
+        dia = agendamento.get("data_pagamento") or agendamento["data_hora"][:10]
         descricao = (
             f"{agendamento['servico_nome']} — {agendamento['pet_nome']} "
             f"({agendamento['tutor_nome']})"
