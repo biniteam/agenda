@@ -6,6 +6,7 @@ import sqlite3
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from dateutil.rrule import rrulestr, rruleset
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
@@ -27,6 +28,8 @@ AGENDAMENTO_SELECT = """
         a.profissional,
         a.valor_cobrado,
         a.observacoes,
+        a.rrule,
+        a.exdate,
         p.nome AS pet_nome,
         p.temperamento,
         p.alergias_restricoes,
@@ -96,6 +99,8 @@ def init_db() -> None:
                 profissional TEXT,
                 valor_cobrado REAL,
                 observacoes TEXT,
+                rrule TEXT DEFAULT NULL,
+                exdate TEXT DEFAULT NULL,
                 FOREIGN KEY (pet_id) REFERENCES pets(id),
                 FOREIGN KEY (servico_id) REFERENCES servicos(id)
             );
@@ -112,7 +117,17 @@ def init_db() -> None:
             );
             """
         )
+        _migrate_db(conn)
         _seed_servicos(conn)
+
+
+def _migrate_db(conn: sqlite3.Connection) -> None:
+    # Check existing columns in agendamentos
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(agendamentos)").fetchall()]
+    if "rrule" not in columns:
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN rrule TEXT DEFAULT NULL")
+    if "exdate" not in columns:
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN exdate TEXT DEFAULT NULL")
 
 
 def _seed_servicos(conn: sqlite3.Connection) -> None:
@@ -360,19 +375,78 @@ def listar_servicos() -> list[dict[str, Any]]:
     return _as_dicts(rows)
 
 
-# --- Agendamentos ---
+# --- Agendamentos e Recorrência ---
+
+
+def expandir_agendamentos(
+    agendamentos: list[dict[str, Any]],
+    janela_inicio: datetime,
+    janela_fim: datetime,
+) -> list[dict[str, Any]]:
+    """
+    Dada uma lista de agendamentos e uma janela de tempo [janela_inicio, janela_fim],
+    expande as ocorrências recorrentes via rrule.between().
+    """
+    resultados: list[dict[str, Any]] = []
+
+    for item in agendamentos:
+        rrule_str = item.get("rrule")
+        dtstart = datetime.strptime(item["data_hora"][:19], "%Y-%m-%d %H:%M:%S")
+
+        # Parse exdates
+        exdates: set[datetime] = set()
+        if item.get("exdate"):
+            for ex in item["exdate"].split(","):
+                ex_str = ex.strip()
+                if ex_str:
+                    try:
+                        exdates.add(datetime.strptime(ex_str[:19], "%Y-%m-%d %H:%M:%S"))
+                    except ValueError:
+                        pass
+
+        if not rrule_str:
+            # Evento único
+            if janela_inicio <= dtstart <= janela_fim and dtstart not in exdates:
+                resultados.append(dict(item))
+            continue
+
+        # Evento recorrente
+        try:
+            rule = rrulestr(rrule_str, dtstart=dtstart)
+            rs = rruleset()
+            rs.rrule(rule)
+            for ex in exdates:
+                rs.exdate(ex)
+
+            instancias = rs.between(janela_inicio, janela_fim, inc=True)
+            for inst in instancias:
+                novo_item = dict(item)
+                novo_item["data_hora"] = inst.strftime("%Y-%m-%d %H:%M:%S")
+                novo_item["e_recorrente"] = True
+                resultados.append(novo_item)
+        except Exception:
+            # Em caso de falha de parsing da rrule, cai para o evento estático
+            if janela_inicio <= dtstart <= janela_fim and dtstart not in exdates:
+                resultados.append(dict(item))
+
+    # Ordenar resultados por data_hora
+    resultados.sort(key=lambda x: x["data_hora"])
+    return resultados
 
 
 def listar_agendamentos(inicio: date, fim: date) -> list[dict[str, Any]]:
-    inicio_txt = f"{_iso_date(inicio)} 00:00:00"
-    fim_txt = f"{_iso_date(fim)} 23:59:59"
+    janela_inicio = datetime.combine(inicio, time(0, 0, 0))
+    janela_fim = datetime.combine(fim, time(23, 59, 59))
+
     with get_connection() as conn:
+        # Busca eventos que iniciaram até a data final da janela (ou eventos recorrentes)
         rows = conn.execute(
-            AGENDAMENTO_SELECT
-            + " WHERE a.data_hora BETWEEN ? AND ? ORDER BY a.data_hora",
-            (inicio_txt, fim_txt),
+            AGENDAMENTO_SELECT + " WHERE a.data_hora <= ? OR a.rrule IS NOT NULL",
+            (f"{_iso_date(fim)} 23:59:59",),
         ).fetchall()
-    return _as_dicts(rows)
+
+    todos = _as_dicts(rows)
+    return expandir_agendamentos(todos, janela_inicio, janela_fim)
 
 
 def totais_por_dia(ano: int, mes: int) -> dict[str, dict[str, Any]]:
@@ -408,16 +482,22 @@ def salvar_agendamento(
     profissional: str = "",
     valor_cobrado: float | None = None,
     observacoes: str = "",
+    rrule: str | None = None,
+    exdate: str | None = None,
     agendamento_id: int | None = None,
 ) -> int:
     instante = _iso_datetime(data_hora)
+    rrule_val = rrule.strip() if rrule and rrule.strip() else None
+    exdate_val = exdate.strip() if exdate and exdate.strip() else None
+
     with get_connection() as conn:
         if agendamento_id:
             conn.execute(
                 """
                 UPDATE agendamentos
                 SET pet_id = ?, servico_id = ?, data_hora = ?, status = ?,
-                    profissional = ?, valor_cobrado = ?, observacoes = ?
+                    profissional = ?, valor_cobrado = ?, observacoes = ?,
+                    rrule = ?, exdate = ?
                 WHERE id = ?
                 """,
                 (
@@ -428,6 +508,8 @@ def salvar_agendamento(
                     profissional.strip(),
                     valor_cobrado,
                     observacoes.strip(),
+                    rrule_val,
+                    exdate_val,
                     agendamento_id,
                 ),
             )
@@ -437,8 +519,8 @@ def salvar_agendamento(
                 """
                 INSERT INTO agendamentos (
                     pet_id, servico_id, data_hora, status, profissional,
-                    valor_cobrado, observacoes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    valor_cobrado, observacoes, rrule, exdate
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pet_id,
@@ -448,11 +530,33 @@ def salvar_agendamento(
                     profissional.strip(),
                     valor_cobrado,
                     observacoes.strip(),
+                    rrule_val,
+                    exdate_val,
                 ),
             )
             novo_id = int(cursor.lastrowid)
     _sincronizar_receita_agendamento(novo_id)
     return novo_id
+
+
+def adicionar_excecao_agendamento(agendamento_id: int, data_hora_excecao: str | datetime) -> None:
+    agendamento = obter_agendamento(agendamento_id)
+    if not agendamento:
+        return
+    instante_str = _iso_datetime(data_hora_excecao)
+    exdates_existentes = set()
+    if agendamento.get("exdate"):
+        for ex in agendamento["exdate"].split(","):
+            if ex.strip():
+                exdates_existentes.add(ex.strip())
+    exdates_existentes.add(instante_str)
+    novo_exdate_str = ",".join(sorted(exdates_existentes))
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE agendamentos SET exdate = ? WHERE id = ?",
+            (novo_exdate_str, agendamento_id),
+        )
 
 
 def atualizar_status_agendamento(agendamento_id: int, status: str) -> None:
