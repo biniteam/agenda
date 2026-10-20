@@ -58,6 +58,21 @@ def test_construir_e_decodificar_rrule():
     assert decoded_weekly["frequencia"] == "Semanal"
     assert set(decoded_weekly["dias_semana"]) == {0, 2}
 
+    # Quinzenal (Segunda=0, Quarta=2)
+    r_biweekly = construir_rrule("Quinzenal", [0, 2])
+    assert r_biweekly == "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE"
+    decoded_biweekly = decodificar_rrule(r_biweekly)
+    assert decoded_biweekly["repetir"] is True
+    assert decoded_biweekly["frequencia"] == "Quinzenal"
+    assert set(decoded_biweekly["dias_semana"]) == {0, 2}
+
+    # Quinzenal (sem dias explícitos)
+    r_biweekly_default = construir_rrule("Quinzenal")
+    assert r_biweekly_default == "FREQ=WEEKLY;INTERVAL=2"
+    decoded_biweekly_default = decodificar_rrule(r_biweekly_default)
+    assert decoded_biweekly_default["repetir"] is True
+    assert decoded_biweekly_default["frequencia"] == "Quinzenal"
+
     # Mensal
     r_monthly = construir_rrule("Mensal")
     assert r_monthly == "FREQ=MONTHLY"
@@ -281,3 +296,27 @@ def test_controle_pagamento_e_sincronizacao_financeira():
 
         fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = ?", (ag_id,)).fetchall()
         assert len(fin) == 0
+
+
+def test_expansao_evento_recorrente_quinzenal():
+    """Testa evento recorrente quinzenal (uma semana sim, outra não)."""
+    item = {
+        "id": 1,
+        "data_hora": "2025-03-03 10:00:00",
+        "rrule": "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO",
+        "exdate": None,
+        "status": "Agendado",
+    }
+    w_start = datetime(2025, 3, 1, 0, 0, 0)
+    w_end = datetime(2025, 3, 31, 23, 59, 59)
+
+    res = expandir_agendamentos([item], w_start, w_end)
+    datas = [r["data_hora"] for r in res]
+
+    # Devem ser geradas 3 ocorrências em Março/2025: 03/03, 17/03 e 31/03
+    assert len(res) == 3
+    assert "2025-03-03 10:00:00" in datas
+    assert "2025-03-17 10:00:00" in datas
+    assert "2025-03-31 10:00:00" in datas
+    assert "2025-03-10 10:00:00" not in datas
+    assert "2025-03-24 10:00:00" not in datas
