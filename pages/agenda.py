@@ -112,7 +112,7 @@ def formulario_agendamento(dia_padrao: date) -> None:
 
     titulo = "Editar agendamento (Série)" if editando else "Novo agendamento"
     with st.expander(titulo, expanded=bool(editando)):
-        with st.form("form_agendamento"):
+        with st.container(border=True):
             pet_id = st.selectbox(
                 "Pet",
                 options=pet_ids,
@@ -166,7 +166,7 @@ def formulario_agendamento(dia_padrao: date) -> None:
 
             if repetir:
                 col_freq, col_dias = st.columns((1, 2))
-                opcoes_freq = ("Diário", "Semanal", "Mensal")
+                opcoes_freq = ("Diário", "Semanal", "Quinzenal", "Mensal")
                 freq_idx = (
                     opcoes_freq.index(config_rrule["frequencia"])
                     if config_rrule["frequencia"] in opcoes_freq
@@ -175,7 +175,7 @@ def formulario_agendamento(dia_padrao: date) -> None:
                 frequencia = col_freq.selectbox("Frequência", opcoes_freq, index=freq_idx)
 
                 dias_selecionados_idx = []
-                if frequencia == "Semanal":
+                if frequencia in ("Semanal", "Quinzenal"):
                     dias_iniciais = (
                         config_rrule["dias_semana"]
                         if config_rrule["dias_semana"]
@@ -197,9 +197,9 @@ def formulario_agendamento(dia_padrao: date) -> None:
                 value=editando["observacoes"] if editando else "",
             )
             col_a, col_b, col_c = st.columns(3)
-            salvar = col_a.form_submit_button("Salvar", type="primary")
-            cancelar = col_b.form_submit_button("Cancelar edição") if editando else False
-            excluir = col_c.form_submit_button("Excluir série") if editando else False
+            salvar = col_a.button("Salvar", type="primary", key="btn_salvar_agendamento")
+            cancelar = col_b.button("Cancelar edição", key="btn_cancelar_agendamento") if editando else False
+            excluir = col_c.button("Excluir série", key="btn_excluir_agendamento") if editando else False
 
         if cancelar:
             st.session_state.agendamento_edit_id = None

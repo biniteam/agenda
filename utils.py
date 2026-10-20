@@ -71,7 +71,7 @@ def link_whatsapp(telefone: str | None, mensagem: str) -> str | None:
 def construir_rrule(frequencia: str, dias_semana_indices: list[int] | None = None) -> str | None:
     """
     Gera uma string RRULE válida com base nas opções da interface.
-    frequencia: 'Diário', 'Semanal', 'Mensal'
+    frequencia: 'Diário', 'Semanal', 'Quinzenal', 'Mensal'
     dias_semana_indices: lista de inteiros 0=Segunda, 1=Terça, ..., 6=Domingo
     """
     if frequencia == "Diário":
@@ -81,6 +81,11 @@ def construir_rrule(frequencia: str, dias_semana_indices: list[int] | None = Non
             return "FREQ=WEEKLY"
         dias_str = ",".join(MAPA_DIAS_RRULE[i] for i in sorted(dias_semana_indices))
         return f"FREQ=WEEKLY;BYDAY={dias_str}"
+    elif frequencia == "Quinzenal":
+        if not dias_semana_indices:
+            return "FREQ=WEEKLY;INTERVAL=2"
+        dias_str = ",".join(MAPA_DIAS_RRULE[i] for i in sorted(dias_semana_indices))
+        return f"FREQ=WEEKLY;INTERVAL=2;BYDAY={dias_str}"
     elif frequencia == "Mensal":
         return "FREQ=MONTHLY"
     return None
@@ -97,7 +102,12 @@ def decodificar_rrule(rrule_str: str | None) -> dict:
     try:
         rule = rrulestr(rrule_str)
         freq_map = {0: "Yearly", 1: "Mensal", 2: "Semanal", 3: "Diário"}
-        res["frequencia"] = freq_map.get(rule._freq, "Diário")
+        freq_nome = freq_map.get(rule._freq, "Diário")
+
+        if freq_nome == "Semanal" and rule._interval == 2:
+            freq_nome = "Quinzenal"
+
+        res["frequencia"] = freq_nome
 
         if rule._byweekday:
             res["dias_semana"] = list(rule._byweekday)
