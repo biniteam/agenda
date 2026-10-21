@@ -36,7 +36,14 @@ def setup_tmp_db(tmp_path, monkeypatch):
 def test_schema_migration():
     """Verifica se as colunas 'rrule' e 'exdate' existem no banco de dados."""
     with get_connection() as conn:
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(agendamentos)").fetchall()]
+        if conn.is_postgres:
+            rows = conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'agendamentos'"
+            ).fetchall()
+            cols = [r["column_name"] for r in rows]
+        else:
+            raw_cur = conn.conn.cursor()
+            cols = [row[1] for row in raw_cur.execute("PRAGMA table_info(agendamentos)").fetchall()]
         assert "rrule" in cols
         assert "exdate" in cols
 
@@ -163,8 +170,6 @@ def test_recorrencia_meses_tamanhos_diferentes():
     w_end = datetime(2025, 3, 31, 23, 59, 59)
 
     res = expandir_agendamentos([item_31], w_start, w_end)
-    # python-dateutil ignora Fevereiro se não houver dia 31 no mês ao usar FREQ=MONTHLY sem BYMONTHDAY especial,
-    # ou mapeia se houver regras específicas. Verificamos que o comportamento do dateutil funciona sem erros.
     assert isinstance(res, list)
     for r in res:
         dt = datetime.strptime(r["data_hora"], "%Y-%m-%d %H:%M:%S")
@@ -266,11 +271,11 @@ def test_controle_pagamento_e_sincronizacao_financeira():
     )
 
     with get_connection() as conn:
-        row = conn.execute("SELECT * FROM agendamentos WHERE id = ?", (ag_id,)).fetchone()
+        row = conn.execute("SELECT * FROM agendamentos WHERE id = %s", (ag_id,)).fetchone()
         assert row["pago"] == 0
         assert row["data_pagamento"] is None
 
-        fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = ?", (ag_id,)).fetchall()
+        fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = %s", (ag_id,)).fetchall()
         assert len(fin) == 0
 
     # 2. Atualizar agendamento para pago=1 com data_pagamento
@@ -278,23 +283,23 @@ def test_controle_pagamento_e_sincronizacao_financeira():
     atualizar_pago_agendamento(ag_id, pago=1, data_pagamento=dt_pag)
 
     with get_connection() as conn:
-        row = conn.execute("SELECT * FROM agendamentos WHERE id = ?", (ag_id,)).fetchone()
+        row = conn.execute("SELECT * FROM agendamentos WHERE id = %s", (ag_id,)).fetchone()
         assert row["pago"] == 1
-        assert row["data_pagamento"] == "2025-03-12"
+        assert str(row["data_pagamento"]) == "2025-03-12"
 
-        fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = ?", (ag_id,)).fetchall()
+        fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = %s", (ag_id,)).fetchall()
         assert len(fin) == 1
         assert fin[0]["tipo"] == "Receita"
-        assert fin[0]["data"] == "2025-03-12"
+        assert str(fin[0]["data"]) == "2025-03-12"
 
     # 3. Alterar para pago=0 deve remover o lançamento do financeiro
     atualizar_pago_agendamento(ag_id, pago=0)
 
     with get_connection() as conn:
-        row = conn.execute("SELECT * FROM agendamentos WHERE id = ?", (ag_id,)).fetchone()
+        row = conn.execute("SELECT * FROM agendamentos WHERE id = %s", (ag_id,)).fetchone()
         assert row["pago"] == 0
 
-        fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = ?", (ag_id,)).fetchall()
+        fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = %s", (ag_id,)).fetchall()
         assert len(fin) == 0
 
 

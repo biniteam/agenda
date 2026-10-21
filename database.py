@@ -1,12 +1,26 @@
-"""Conexão SQLite, schema e consultas do pet shop."""
+"""Conexão PostgreSQL / Supabase (com suporte a SQLite para testes), schema e consultas do pet shop."""
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from dateutil.rrule import rrulestr, rruleset
+
+try:
+    import streamlit as st
+except ImportError:
+    st = None
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    psycopg2 = None
+    PSYCOPG2_AVAILABLE = False
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
@@ -50,109 +64,329 @@ AGENDAMENTO_SELECT = """
 """
 
 
-def get_connection() -> sqlite3.Connection:
+def _get_database_url() -> str | None:
+    # 1. Tentar st.secrets["supabase"]
+    if st is not None:
+        try:
+            supabase_secrets = st.secrets.get("supabase")
+            if isinstance(supabase_secrets, dict):
+                url = supabase_secrets.get("db_url") or supabase_secrets.get("url") or supabase_secrets.get("connection_string")
+                if url:
+                    return str(url)
+            elif isinstance(supabase_secrets, str):
+                return supabase_secrets
+
+            url_secret = st.secrets.get("DATABASE_URL") or st.secrets.get("SUPABASE_DB_URL")
+            if url_secret:
+                return str(url_secret)
+        except Exception:
+            pass
+
+    # 2. Tentar variáveis de ambiente
+    for env_var in ("SUPABASE_DB_URL", "DATABASE_URL", "POSTGRES_URL"):
+        if os.getenv(env_var):
+            return os.getenv(env_var)
+
+    # 3. Construir URL a partir de variáveis de ambiente separadas do Supabase/Postgres
+    user = os.getenv("PGUSER") or os.getenv("SUPABASE_USER")
+    password = os.getenv("PGPASSWORD") or os.getenv("SUPABASE_PASSWORD")
+    host = os.getenv("PGHOST") or os.getenv("SUPABASE_HOST")
+    port = os.getenv("PGPORT") or os.getenv("SUPABASE_PORT") or "5432"
+    dbname = os.getenv("PGDATABASE") or os.getenv("SUPABASE_DB") or "postgres"
+
+    if user and password and host:
+        return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+
+    return None
+
+
+class CursorWrapper:
+    """Wrapper unificado para tratar diferenças entre psycopg2 e sqlite3 cursors."""
+
+    def __init__(self, cursor: Any, is_postgres: bool):
+        self.cursor = cursor
+        self.is_postgres = is_postgres
+
+    def execute(self, sql: str, params: tuple | list | dict = ()) -> CursorWrapper:
+        if not self.is_postgres:
+            sql = sql.replace("%s", "?")
+            self.cursor.execute(sql, params)
+        else:
+            self.cursor.execute(sql, params)
+        return self
+
+    def executemany(self, sql: str, param_list: list) -> CursorWrapper:
+        if not self.is_postgres:
+            sql = sql.replace("%s", "?")
+            self.cursor.executemany(sql, param_list)
+        else:
+            self.cursor.executemany(sql, param_list)
+        return self
+
+    def fetchone(self) -> dict[str, Any] | None:
+        row = self.cursor.fetchone()
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return row
+        if hasattr(row, "keys"):
+            return dict(row)
+        if isinstance(row, (list, tuple)):
+            # Se for tuple sem keys (ex COUNT(*)), mapeia se tiver descrição
+            if self.cursor.description:
+                cols = [desc[0] for desc in self.cursor.description]
+                return dict(zip(cols, row))
+        return row
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        rows = self.cursor.fetchall()
+        if not rows:
+            return []
+        if isinstance(rows[0], dict):
+            return list(rows)
+        if hasattr(rows[0], "keys"):
+            return [dict(r) for r in rows[0:]]
+        if self.cursor.description:
+            cols = [desc[0] for desc in self.cursor.description]
+            return [dict(zip(cols, r)) for r in rows]
+        return rows
+
+    @property
+    def lastrowid(self) -> int | None:
+        if hasattr(self.cursor, "lastrowid"):
+            return self.cursor.lastrowid
+        return None
+
+
+class ConnectionWrapper:
+    """Wrapper de conexão unificado com autocommit/commit context management."""
+
+    def __init__(self, conn: Any, is_postgres: bool):
+        self.conn = conn
+        self.is_postgres = is_postgres
+
+    def __enter__(self) -> ConnectionWrapper:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.conn.commit()
+        else:
+            self.conn.rollback()
+        self.conn.close()
+
+    def cursor(self) -> CursorWrapper:
+        if self.is_postgres:
+            cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        else:
+            cur = self.conn.cursor()
+        return CursorWrapper(cur, self.is_postgres)
+
+    def execute(self, sql: str, params: tuple | list | dict = ()) -> CursorWrapper:
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def executemany(self, sql: str, param_list: list) -> CursorWrapper:
+        cur = self.cursor()
+        cur.executemany(sql, param_list)
+        return cur
+
+    def executescript(self, script: str) -> None:
+        cur = self.conn.cursor()
+        if self.is_postgres:
+            cur.execute(script)
+        else:
+            cur.executescript(script)
+
+
+def get_connection() -> ConnectionWrapper:
+    db_url = _get_database_url()
+    if db_url and PSYCOPG2_AVAILABLE:
+        try:
+            conn = psycopg2.connect(db_url)
+            return ConnectionWrapper(conn, is_postgres=True)
+        except Exception as e:
+            # Em caso de falha de conexão remota, fallback para SQLite local se apropriado
+            pass
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return ConnectionWrapper(conn, is_postgres=False)
 
 
 def init_db() -> None:
     with get_connection() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS clientes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                telefone TEXT,
-                endereco TEXT,
-                observacoes TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-            );
+        if conn.is_postgres:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS clientes (
+                    id SERIAL PRIMARY KEY,
+                    nome TEXT NOT NULL,
+                    telefone TEXT,
+                    endereco TEXT,
+                    observacoes TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
 
-            CREATE TABLE IF NOT EXISTS pets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cliente_id INTEGER NOT NULL,
-                nome TEXT NOT NULL,
-                especie TEXT,
-                raca TEXT,
-                porte TEXT,
-                pelagem TEXT,
-                data_nascimento TEXT,
-                temperamento TEXT,
-                alergias_restricoes TEXT,
-                FOREIGN KEY (cliente_id) REFERENCES clientes(id)
-            );
+                CREATE TABLE IF NOT EXISTS pets (
+                    id SERIAL PRIMARY KEY,
+                    cliente_id INTEGER NOT NULL,
+                    nome TEXT NOT NULL,
+                    especie TEXT,
+                    raca TEXT,
+                    porte TEXT,
+                    pelagem TEXT,
+                    data_nascimento TEXT,
+                    temperamento TEXT,
+                    alergias_restricoes TEXT,
+                    FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+                );
 
-            CREATE TABLE IF NOT EXISTS servicos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                preco_padrao REAL NOT NULL DEFAULT 0,
-                duracao_minutos INTEGER NOT NULL DEFAULT 60
-            );
+                CREATE TABLE IF NOT EXISTS servicos (
+                    id SERIAL PRIMARY KEY,
+                    nome TEXT NOT NULL,
+                    preco_padrao REAL NOT NULL DEFAULT 0,
+                    duracao_minutos INTEGER NOT NULL DEFAULT 60
+                );
 
-            CREATE TABLE IF NOT EXISTS agendamentos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pet_id INTEGER NOT NULL,
-                servico_id INTEGER NOT NULL,
-                data_hora TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'Agendado',
-                profissional TEXT,
-                valor_cobrado REAL,
-                observacoes TEXT,
-                rrule TEXT DEFAULT NULL,
-                exdate TEXT DEFAULT NULL,
-                pago INTEGER NOT NULL DEFAULT 0,
-                data_pagamento TEXT DEFAULT NULL,
-                FOREIGN KEY (pet_id) REFERENCES pets(id),
-                FOREIGN KEY (servico_id) REFERENCES servicos(id)
-            );
+                CREATE TABLE IF NOT EXISTS agendamentos (
+                    id SERIAL PRIMARY KEY,
+                    pet_id INTEGER NOT NULL,
+                    servico_id INTEGER NOT NULL,
+                    data_hora TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'Agendado',
+                    profissional TEXT,
+                    valor_cobrado REAL,
+                    observacoes TEXT,
+                    rrule TEXT DEFAULT NULL,
+                    exdate TEXT DEFAULT NULL,
+                    pago INTEGER NOT NULL DEFAULT 0,
+                    data_pagamento TEXT DEFAULT NULL,
+                    FOREIGN KEY (pet_id) REFERENCES pets(id),
+                    FOREIGN KEY (servico_id) REFERENCES servicos(id)
+                );
 
-            CREATE TABLE IF NOT EXISTS financeiro (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tipo TEXT NOT NULL,
-                categoria TEXT,
-                descricao TEXT,
-                valor REAL NOT NULL,
-                data TEXT NOT NULL,
-                agendamento_id INTEGER,
-                FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
-            );
-            """
-        )
+                CREATE TABLE IF NOT EXISTS financeiro (
+                    id SERIAL PRIMARY KEY,
+                    tipo TEXT NOT NULL,
+                    categoria TEXT,
+                    descricao TEXT,
+                    valor REAL NOT NULL,
+                    data TEXT NOT NULL,
+                    agendamento_id INTEGER,
+                    FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
+                );
+                """
+            )
+        else:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS clientes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome TEXT NOT NULL,
+                    telefone TEXT,
+                    endereco TEXT,
+                    observacoes TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS pets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cliente_id INTEGER NOT NULL,
+                    nome TEXT NOT NULL,
+                    especie TEXT,
+                    raca TEXT,
+                    porte TEXT,
+                    pelagem TEXT,
+                    data_nascimento TEXT,
+                    temperamento TEXT,
+                    alergias_restricoes TEXT,
+                    FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS servicos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome TEXT NOT NULL,
+                    preco_padrao REAL NOT NULL DEFAULT 0,
+                    duracao_minutos INTEGER NOT NULL DEFAULT 60
+                );
+
+                CREATE TABLE IF NOT EXISTS agendamentos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pet_id INTEGER NOT NULL,
+                    servico_id INTEGER NOT NULL,
+                    data_hora TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'Agendado',
+                    profissional TEXT,
+                    valor_cobrado REAL,
+                    observacoes TEXT,
+                    rrule TEXT DEFAULT NULL,
+                    exdate TEXT DEFAULT NULL,
+                    pago INTEGER NOT NULL DEFAULT 0,
+                    data_pagamento TEXT DEFAULT NULL,
+                    FOREIGN KEY (pet_id) REFERENCES pets(id),
+                    FOREIGN KEY (servico_id) REFERENCES servicos(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS financeiro (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tipo TEXT NOT NULL,
+                    categoria TEXT,
+                    descricao TEXT,
+                    valor REAL NOT NULL,
+                    data TEXT NOT NULL,
+                    agendamento_id INTEGER,
+                    FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
+                );
+                """
+            )
         _migrate_db(conn)
         _seed_servicos(conn)
 
 
-def _migrate_db(conn: sqlite3.Connection) -> None:
-    # Check existing columns in agendamentos
-    columns = [row[1] for row in conn.execute("PRAGMA table_info(agendamentos)").fetchall()]
-    if "rrule" not in columns:
-        conn.execute("ALTER TABLE agendamentos ADD COLUMN rrule TEXT DEFAULT NULL")
-    if "exdate" not in columns:
-        conn.execute("ALTER TABLE agendamentos ADD COLUMN exdate TEXT DEFAULT NULL")
-    if "pago" not in columns:
-        conn.execute("ALTER TABLE agendamentos ADD COLUMN pago INTEGER NOT NULL DEFAULT 0")
-    if "data_pagamento" not in columns:
-        conn.execute("ALTER TABLE agendamentos ADD COLUMN data_pagamento TEXT DEFAULT NULL")
+def _migrate_db(conn: ConnectionWrapper) -> None:
+    if conn.is_postgres:
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS rrule TEXT DEFAULT NULL")
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS exdate TEXT DEFAULT NULL")
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS pago INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS data_pagamento TEXT DEFAULT NULL")
+    else:
+        # SQLite
+        raw_cur = conn.conn.cursor()
+        columns = [row[1] for row in raw_cur.execute("PRAGMA table_info(agendamentos)").fetchall()]
+        if "rrule" not in columns:
+            conn.execute("ALTER TABLE agendamentos ADD COLUMN rrule TEXT DEFAULT NULL")
+        if "exdate" not in columns:
+            conn.execute("ALTER TABLE agendamentos ADD COLUMN exdate TEXT DEFAULT NULL")
+        if "pago" not in columns:
+            conn.execute("ALTER TABLE agendamentos ADD COLUMN pago INTEGER NOT NULL DEFAULT 0")
+        if "data_pagamento" not in columns:
+            conn.execute("ALTER TABLE agendamentos ADD COLUMN data_pagamento TEXT DEFAULT NULL")
 
 
-def _seed_servicos(conn: sqlite3.Connection) -> None:
-    count = conn.execute("SELECT COUNT(*) FROM servicos").fetchone()[0]
+def _seed_servicos(conn: ConnectionWrapper) -> None:
+    res = conn.execute("SELECT COUNT(*) AS cnt FROM servicos").fetchone()
+    count = res["cnt"] if res and "cnt" in res else (list(res.values())[0] if res else 0)
     if count:
         return
     conn.executemany(
-        "INSERT INTO servicos (nome, preco_padrao, duracao_minutos) VALUES (?, ?, ?)",
+        "INSERT INTO servicos (nome, preco_padrao, duracao_minutos) VALUES (%s, %s, %s)",
         SERVICOS_PADRAO,
     )
 
 
-def _as_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    return dict(row) if row is not None else None
+def _as_dict(row: Any) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row
+    return dict(row)
 
 
-def _as_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+def _as_dicts(rows: list[Any]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
@@ -181,7 +415,7 @@ def listar_clientes() -> list[dict[str, Any]]:
             FROM clientes c
             LEFT JOIN pets p ON p.cliente_id = c.id
             GROUP BY c.id
-            ORDER BY c.nome COLLATE NOCASE
+            ORDER BY c.nome
             """
         ).fetchall()
     return _as_dicts(rows)
@@ -189,7 +423,7 @@ def listar_clientes() -> list[dict[str, Any]]:
 
 def obter_cliente(cliente_id: int) -> dict[str, Any] | None:
     with get_connection() as conn:
-        row = conn.execute("SELECT * FROM clientes WHERE id = ?", (cliente_id,)).fetchone()
+        row = conn.execute("SELECT * FROM clientes WHERE id = %s", (cliente_id,)).fetchone()
     return _as_dict(row)
 
 
@@ -205,30 +439,35 @@ def salvar_cliente(
             conn.execute(
                 """
                 UPDATE clientes
-                SET nome = ?, telefone = ?, endereco = ?, observacoes = ?
-                WHERE id = ?
+                SET nome = %s, telefone = %s, endereco = %s, observacoes = %s
+                WHERE id = %s
                 """,
                 (nome.strip(), telefone.strip(), endereco.strip(), observacoes.strip(), cliente_id),
             )
             return cliente_id
-        cursor = conn.execute(
+
+        cur = conn.execute(
             """
             INSERT INTO clientes (nome, telefone, endereco, observacoes)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
             """,
             (nome.strip(), telefone.strip(), endereco.strip(), observacoes.strip()),
         )
-        return int(cursor.lastrowid)
+        res = cur.fetchone()
+        if res and "id" in res:
+            return int(res["id"])
+        return int(cur.lastrowid)
 
 
 def excluir_cliente(cliente_id: int) -> None:
     with get_connection() as conn:
         pets = conn.execute(
-            "SELECT id FROM pets WHERE cliente_id = ?", (cliente_id,)
+            "SELECT id FROM pets WHERE cliente_id = %s", (cliente_id,)
         ).fetchall()
         pet_ids = [row["id"] for row in pets]
         if pet_ids:
-            placeholders = ",".join("?" * len(pet_ids))
+            placeholders = ",".join("%s" for _ in pet_ids)
             conn.execute(
                 f"DELETE FROM financeiro WHERE agendamento_id IN "
                 f"(SELECT id FROM agendamentos WHERE pet_id IN ({placeholders}))",
@@ -238,8 +477,8 @@ def excluir_cliente(cliente_id: int) -> None:
                 f"DELETE FROM agendamentos WHERE pet_id IN ({placeholders})",
                 pet_ids,
             )
-            conn.execute("DELETE FROM pets WHERE cliente_id = ?", (cliente_id,))
-        conn.execute("DELETE FROM clientes WHERE id = ?", (cliente_id,))
+            conn.execute("DELETE FROM pets WHERE cliente_id = %s", (cliente_id,))
+        conn.execute("DELETE FROM clientes WHERE id = %s", (cliente_id,))
 
 
 # --- Pets ---
@@ -251,11 +490,11 @@ def listar_pets(cliente_id: int | None = None) -> list[dict[str, Any]]:
         FROM pets p
         JOIN clientes c ON c.id = p.cliente_id
     """
-    params: tuple[Any, ...] = ()
+    params: list[Any] = []
     if cliente_id is not None:
-        sql += " WHERE p.cliente_id = ?"
-        params = (cliente_id,)
-    sql += " ORDER BY c.nome COLLATE NOCASE, p.nome COLLATE NOCASE"
+        sql += " WHERE p.cliente_id = %s"
+        params.append(cliente_id)
+    sql += " ORDER BY c.nome, p.nome"
     with get_connection() as conn:
         rows = conn.execute(sql, params).fetchall()
     return _as_dicts(rows)
@@ -268,7 +507,7 @@ def obter_pet(pet_id: int) -> dict[str, Any] | None:
             SELECT p.*, c.nome AS tutor_nome, c.telefone AS tutor_telefone
             FROM pets p
             JOIN clientes c ON c.id = p.cliente_id
-            WHERE p.id = ?
+            WHERE p.id = %s
             """,
             (pet_id,),
         ).fetchone()
@@ -293,10 +532,10 @@ def salvar_pet(
             conn.execute(
                 """
                 UPDATE pets
-                SET cliente_id = ?, nome = ?, especie = ?, raca = ?, porte = ?,
-                    pelagem = ?, data_nascimento = ?, temperamento = ?,
-                    alergias_restricoes = ?
-                WHERE id = ?
+                SET cliente_id = %s, nome = %s, especie = %s, raca = %s, porte = %s,
+                    pelagem = %s, data_nascimento = %s, temperamento = %s,
+                    alergias_restricoes = %s
+                WHERE id = %s
                 """,
                 (
                     cliente_id,
@@ -312,12 +551,14 @@ def salvar_pet(
                 ),
             )
             return pet_id
-        cursor = conn.execute(
+
+        cur = conn.execute(
             """
             INSERT INTO pets (
                 cliente_id, nome, especie, raca, porte, pelagem,
                 data_nascimento, temperamento, alergias_restricoes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 cliente_id,
@@ -331,24 +572,27 @@ def salvar_pet(
                 alergias_restricoes.strip(),
             ),
         )
-        return int(cursor.lastrowid)
+        res = cur.fetchone()
+        if res and "id" in res:
+            return int(res["id"])
+        return int(cur.lastrowid)
 
 
 def excluir_pet(pet_id: int) -> None:
     with get_connection() as conn:
         conn.execute(
             "DELETE FROM financeiro WHERE agendamento_id IN "
-            "(SELECT id FROM agendamentos WHERE pet_id = ?)",
+            "(SELECT id FROM agendamentos WHERE pet_id = %s)",
             (pet_id,),
         )
-        conn.execute("DELETE FROM agendamentos WHERE pet_id = ?", (pet_id,))
-        conn.execute("DELETE FROM pets WHERE id = ?", (pet_id,))
+        conn.execute("DELETE FROM agendamentos WHERE pet_id = %s", (pet_id,))
+        conn.execute("DELETE FROM pets WHERE id = %s", (pet_id,))
 
 
 def prontuario_pet(pet_id: int) -> list[dict[str, Any]]:
     with get_connection() as conn:
         rows = conn.execute(
-            AGENDAMENTO_SELECT + " WHERE a.pet_id = ? ORDER BY a.data_hora DESC",
+            AGENDAMENTO_SELECT + " WHERE a.pet_id = %s ORDER BY a.data_hora DESC",
             (pet_id,),
         ).fetchall()
     return _as_dicts(rows)
@@ -357,18 +601,32 @@ def prontuario_pet(pet_id: int) -> list[dict[str, Any]]:
 def aniversariantes_do_dia(dia: date) -> list[dict[str, Any]]:
     chave = dia.strftime("%m-%d")
     with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT p.*, c.nome AS tutor_nome, c.telefone AS tutor_telefone
-            FROM pets p
-            JOIN clientes c ON c.id = p.cliente_id
-            WHERE p.data_nascimento IS NOT NULL
-              AND p.data_nascimento != ''
-              AND strftime('%m-%d', p.data_nascimento) = ?
-            ORDER BY p.nome COLLATE NOCASE
-            """,
-            (chave,),
-        ).fetchall()
+        if conn.is_postgres:
+            rows = conn.execute(
+                """
+                SELECT p.*, c.nome AS tutor_nome, c.telefone AS tutor_telefone
+                FROM pets p
+                JOIN clientes c ON c.id = p.cliente_id
+                WHERE p.data_nascimento IS NOT NULL
+                  AND p.data_nascimento != ''
+                  AND TO_CHAR(TO_DATE(p.data_nascimento, 'YYYY-MM-DD'), 'MM-DD') = %s
+                ORDER BY p.nome
+                """,
+                (chave,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT p.*, c.nome AS tutor_nome, c.telefone AS tutor_telefone
+                FROM pets p
+                JOIN clientes c ON c.id = p.cliente_id
+                WHERE p.data_nascimento IS NOT NULL
+                  AND p.data_nascimento != ''
+                  AND strftime('%m-%d', p.data_nascimento) = %s
+                ORDER BY p.nome
+                """,
+                (chave,),
+            ).fetchall()
     return _as_dicts(rows)
 
 
@@ -378,7 +636,7 @@ def aniversariantes_do_dia(dia: date) -> list[dict[str, Any]]:
 def listar_servicos() -> list[dict[str, Any]]:
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM servicos ORDER BY nome COLLATE NOCASE"
+            "SELECT * FROM servicos ORDER BY nome"
         ).fetchall()
     return _as_dicts(rows)
 
@@ -386,9 +644,9 @@ def listar_servicos() -> list[dict[str, Any]]:
 def obter_servico(servico_id: int) -> dict[str, Any] | None:
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT * FROM servicos WHERE id = ?", (servico_id,)
+            "SELECT * FROM servicos WHERE id = %s", (servico_id,)
         ).fetchone()
-    return _as_dict(row) if row else None
+    return _as_dict(row)
 
 
 def salvar_servico(
@@ -402,32 +660,37 @@ def salvar_servico(
             conn.execute(
                 """
                 UPDATE servicos
-                SET nome = ?, preco_padrao = ?, duracao_minutos = ?
-                WHERE id = ?
+                SET nome = %s, preco_padrao = %s, duracao_minutos = %s
+                WHERE id = %s
                 """,
                 (nome.strip(), float(preco_padrao), int(duracao_minutos), servico_id),
             )
             return servico_id
-        cursor = conn.execute(
+
+        cur = conn.execute(
             """
             INSERT INTO servicos (nome, preco_padrao, duracao_minutos)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
+            RETURNING id
             """,
             (nome.strip(), float(preco_padrao), int(duracao_minutos)),
         )
-        return int(cursor.lastrowid)
+        res = cur.fetchone()
+        if res and "id" in res:
+            return int(res["id"])
+        return int(cur.lastrowid)
 
 
 def excluir_servico(servico_id: int) -> tuple[bool, str]:
     with get_connection() as conn:
-        qtd = conn.execute(
-            "SELECT COUNT(*) FROM agendamentos WHERE servico_id = ?", (servico_id,)
-        ).fetchone()[0]
+        res = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM agendamentos WHERE servico_id = %s", (servico_id,)
+        ).fetchone()
+        qtd = res["cnt"] if res and "cnt" in res else (list(res.values())[0] if res else 0)
         if qtd > 0:
             return False, f"Não é possível excluir: existem {qtd} agendamento(s) vinculado(s) a este serviço."
-        conn.execute("DELETE FROM servicos WHERE id = ?", (servico_id,))
+        conn.execute("DELETE FROM servicos WHERE id = %s", (servico_id,))
     return True, "Serviço excluído com sucesso."
-
 
 
 # --- Agendamentos e Recorrência ---
@@ -446,7 +709,7 @@ def expandir_agendamentos(
 
     for item in agendamentos:
         rrule_str = item.get("rrule")
-        dtstart = datetime.strptime(item["data_hora"][:19], "%Y-%m-%d %H:%M:%S")
+        dtstart = datetime.strptime(str(item["data_hora"])[:19], "%Y-%m-%d %H:%M:%S")
 
         # Parse exdates
         exdates: set[datetime] = set()
@@ -485,7 +748,7 @@ def expandir_agendamentos(
                 resultados.append(dict(item))
 
     # Ordenar resultados por data_hora
-    resultados.sort(key=lambda x: x["data_hora"])
+    resultados.sort(key=lambda x: str(x["data_hora"]))
     return resultados
 
 
@@ -494,9 +757,8 @@ def listar_agendamentos(inicio: date, fim: date) -> list[dict[str, Any]]:
     janela_fim = datetime.combine(fim, time(23, 59, 59))
 
     with get_connection() as conn:
-        # Busca eventos que iniciaram até a data final da janela (ou eventos recorrentes)
         rows = conn.execute(
-            AGENDAMENTO_SELECT + " WHERE a.data_hora <= ? OR a.rrule IS NOT NULL",
+            AGENDAMENTO_SELECT + " WHERE a.data_hora <= %s OR a.rrule IS NOT NULL",
             (f"{_iso_date(fim)} 23:59:59",),
         ).fetchall()
 
@@ -514,7 +776,7 @@ def totais_por_dia(ano: int, mes: int) -> dict[str, dict[str, Any]]:
     for item in listar_agendamentos(inicio, fim):
         if item["status"] == "Cancelado":
             continue
-        chave = item["data_hora"][:10]
+        chave = str(item["data_hora"])[:10]
         bucket = totais.setdefault(chave, {"qtd": 0, "valor": 0.0})
         bucket["qtd"] += 1
         bucket["valor"] += float(item["valor_estimado"] or 0)
@@ -524,7 +786,7 @@ def totais_por_dia(ano: int, mes: int) -> dict[str, dict[str, Any]]:
 def obter_agendamento(agendamento_id: int) -> dict[str, Any] | None:
     with get_connection() as conn:
         row = conn.execute(
-            AGENDAMENTO_SELECT + " WHERE a.id = ?", (agendamento_id,)
+            AGENDAMENTO_SELECT + " WHERE a.id = %s", (agendamento_id,)
         ).fetchone()
     return _as_dict(row)
 
@@ -554,10 +816,10 @@ def salvar_agendamento(
             conn.execute(
                 """
                 UPDATE agendamentos
-                SET pet_id = ?, servico_id = ?, data_hora = ?, status = ?,
-                    profissional = ?, valor_cobrado = ?, observacoes = ?,
-                    rrule = ?, exdate = ?, pago = ?, data_pagamento = ?
-                WHERE id = ?
+                SET pet_id = %s, servico_id = %s, data_hora = %s, status = %s,
+                    profissional = %s, valor_cobrado = %s, observacoes = %s,
+                    rrule = %s, exdate = %s, pago = %s, data_pagamento = %s
+                WHERE id = %s
                 """,
                 (
                     pet_id,
@@ -576,12 +838,13 @@ def salvar_agendamento(
             )
             novo_id = agendamento_id
         else:
-            cursor = conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO agendamentos (
                     pet_id, servico_id, data_hora, status, profissional,
                     valor_cobrado, observacoes, rrule, exdate, pago, data_pagamento
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
                 """,
                 (
                     pet_id,
@@ -597,7 +860,12 @@ def salvar_agendamento(
                     data_pagamento_val,
                 ),
             )
-            novo_id = int(cursor.lastrowid)
+            res = cur.fetchone()
+            if res and "id" in res:
+                novo_id = int(res["id"])
+            else:
+                novo_id = int(cur.lastrowid)
+
     _sincronizar_receita_agendamento(novo_id)
     return novo_id
 
@@ -617,7 +885,7 @@ def adicionar_excecao_agendamento(agendamento_id: int, data_hora_excecao: str | 
 
     with get_connection() as conn:
         conn.execute(
-            "UPDATE agendamentos SET exdate = ? WHERE id = ?",
+            "UPDATE agendamentos SET exdate = %s WHERE id = %s",
             (novo_exdate_str, agendamento_id),
         )
 
@@ -625,7 +893,7 @@ def adicionar_excecao_agendamento(agendamento_id: int, data_hora_excecao: str | 
 def atualizar_status_agendamento(agendamento_id: int, status: str) -> None:
     with get_connection() as conn:
         conn.execute(
-            "UPDATE agendamentos SET status = ? WHERE id = ?",
+            "UPDATE agendamentos SET status = %s WHERE id = %s",
             (status, agendamento_id),
         )
     _sincronizar_receita_agendamento(agendamento_id)
@@ -641,11 +909,11 @@ def atualizar_pago_agendamento(
     if pago_val == 1 and not data_pag_val:
         ag = obter_agendamento(agendamento_id)
         if ag:
-            data_pag_val = ag.get("data_pagamento") or ag["data_hora"][:10]
+            data_pag_val = ag.get("data_pagamento") or str(ag["data_hora"])[:10]
 
     with get_connection() as conn:
         conn.execute(
-            "UPDATE agendamentos SET pago = ?, data_pagamento = ? WHERE id = ?",
+            "UPDATE agendamentos SET pago = %s, data_pagamento = %s WHERE id = %s",
             (pago_val, data_pag_val, agendamento_id),
         )
     _sincronizar_receita_agendamento(agendamento_id)
@@ -654,9 +922,9 @@ def atualizar_pago_agendamento(
 def excluir_agendamento(agendamento_id: int) -> None:
     with get_connection() as conn:
         conn.execute(
-            "DELETE FROM financeiro WHERE agendamento_id = ?", (agendamento_id,)
+            "DELETE FROM financeiro WHERE agendamento_id = %s", (agendamento_id,)
         )
-        conn.execute("DELETE FROM agendamentos WHERE id = ?", (agendamento_id,))
+        conn.execute("DELETE FROM agendamentos WHERE id = %s", (agendamento_id,))
 
 
 def _sincronizar_receita_agendamento(agendamento_id: int) -> None:
@@ -665,15 +933,15 @@ def _sincronizar_receita_agendamento(agendamento_id: int) -> None:
         return
     with get_connection() as conn:
         existente = conn.execute(
-            "SELECT id FROM financeiro WHERE agendamento_id = ? AND tipo = 'Receita'",
+            "SELECT id FROM financeiro WHERE agendamento_id = %s AND tipo = 'Receita'",
             (agendamento_id,),
         ).fetchone()
         if not agendamento.get("pago"):
             if existente:
-                conn.execute("DELETE FROM financeiro WHERE id = ?", (existente["id"],))
+                conn.execute("DELETE FROM financeiro WHERE id = %s", (existente["id"],))
             return
         valor = float(agendamento["valor_estimado"] or 0)
-        dia = agendamento.get("data_pagamento") or agendamento["data_hora"][:10]
+        dia = agendamento.get("data_pagamento") or str(agendamento["data_hora"])[:10]
         descricao = (
             f"{agendamento['servico_nome']} — {agendamento['pet_nome']} "
             f"({agendamento['tutor_nome']})"
@@ -682,8 +950,8 @@ def _sincronizar_receita_agendamento(agendamento_id: int) -> None:
             conn.execute(
                 """
                 UPDATE financeiro
-                SET categoria = 'Serviços', descricao = ?, valor = ?, data = ?
-                WHERE id = ?
+                SET categoria = 'Serviços', descricao = %s, valor = %s, data = %s
+                WHERE id = %s
                 """,
                 (descricao, valor, dia, existente["id"]),
             )
@@ -691,7 +959,7 @@ def _sincronizar_receita_agendamento(agendamento_id: int) -> None:
             conn.execute(
                 """
                 INSERT INTO financeiro (tipo, categoria, descricao, valor, data, agendamento_id)
-                VALUES ('Receita', 'Serviços', ?, ?, ?, ?)
+                VALUES ('Receita', 'Serviços', %s, %s, %s, %s)
                 """,
                 (descricao, valor, dia, agendamento_id),
             )
@@ -704,7 +972,7 @@ def listar_lancamentos(inicio: date | None = None, fim: date | None = None) -> l
     sql = "SELECT * FROM financeiro"
     params: list[Any] = []
     if inicio and fim:
-        sql += " WHERE data BETWEEN ? AND ?"
+        sql += " WHERE data BETWEEN %s AND %s"
         params.extend([_iso_date(inicio), _iso_date(fim)])
     sql += " ORDER BY data DESC, id DESC"
     with get_connection() as conn:
@@ -726,26 +994,31 @@ def salvar_lancamento(
             conn.execute(
                 """
                 UPDATE financeiro
-                SET tipo = ?, categoria = ?, descricao = ?, valor = ?, data = ?
-                WHERE id = ? AND agendamento_id IS NULL
+                SET tipo = %s, categoria = %s, descricao = %s, valor = %s, data = %s
+                WHERE id = %s AND agendamento_id IS NULL
                 """,
                 (tipo, categoria, descricao.strip(), valor, dia, lancamento_id),
             )
             return lancamento_id
-        cursor = conn.execute(
+
+        cur = conn.execute(
             """
             INSERT INTO financeiro (tipo, categoria, descricao, valor, data)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (tipo, categoria, descricao.strip(), valor, dia),
         )
-        return int(cursor.lastrowid)
+        res = cur.fetchone()
+        if res and "id" in res:
+            return int(res["id"])
+        return int(cur.lastrowid)
 
 
 def excluir_lancamento(lancamento_id: int) -> None:
     with get_connection() as conn:
         conn.execute(
-            "DELETE FROM financeiro WHERE id = ? AND agendamento_id IS NULL",
+            "DELETE FROM financeiro WHERE id = %s AND agendamento_id IS NULL",
             (lancamento_id,),
         )
 
@@ -758,12 +1031,12 @@ def resumo_financeiro(inicio: date, fim: date) -> dict[str, float]:
                 COALESCE(SUM(CASE WHEN tipo = 'Receita' THEN valor END), 0) AS receitas,
                 COALESCE(SUM(CASE WHEN tipo = 'Despesa' THEN valor END), 0) AS despesas
             FROM financeiro
-            WHERE data BETWEEN ? AND ?
+            WHERE data BETWEEN %s AND %s
             """,
             (_iso_date(inicio), _iso_date(fim)),
         ).fetchone()
-    receitas = float(row["receitas"])
-    despesas = float(row["despesas"])
+    receitas = float(row["receitas"]) if row and row.get("receitas") is not None else 0.0
+    despesas = float(row["despesas"]) if row and row.get("despesas") is not None else 0.0
     return {
         "receitas": receitas,
         "despesas": despesas,
@@ -777,12 +1050,12 @@ def media_faturamento_dias_uteis(inicio: date, fim: date) -> float:
             """
             SELECT data, SUM(valor) AS total
             FROM financeiro
-            WHERE tipo = 'Receita' AND data BETWEEN ? AND ?
+            WHERE tipo = 'Receita' AND data BETWEEN %s AND %s
             GROUP BY data
             """,
             (_iso_date(inicio), _iso_date(fim)),
         ).fetchall()
-    totais = [float(row["total"]) for row in rows if date.fromisoformat(row["data"]).weekday() < 5]
+    totais = [float(row["total"]) for row in rows if date.fromisoformat(str(row["data"])).weekday() < 5]
     if not totais:
         return 0.0
     return sum(totais) / len(totais)
@@ -798,11 +1071,11 @@ def ticket_medio(inicio: date, fim: date) -> float:
             FROM agendamentos a
             JOIN servicos s ON s.id = a.servico_id
             WHERE a.status = 'Concluído'
-              AND a.data_hora BETWEEN ? AND ?
+              AND a.data_hora BETWEEN %s AND %s
             """,
             (inicio_txt, fim_txt),
         ).fetchone()
-    return float(row["media"] or 0)
+    return float(row["media"]) if row and row.get("media") is not None else 0.0
 
 
 def faturamento_semanal(inicio: date, fim: date) -> list[dict[str, Any]]:
@@ -811,13 +1084,13 @@ def faturamento_semanal(inicio: date, fim: date) -> list[dict[str, Any]]:
             """
             SELECT data, SUM(valor) AS total
             FROM financeiro
-            WHERE tipo = 'Receita' AND data BETWEEN ? AND ?
+            WHERE tipo = 'Receita' AND data BETWEEN %s AND %s
             GROUP BY data
             ORDER BY data
             """,
             (_iso_date(inicio), _iso_date(fim)),
         ).fetchall()
-    por_dia = {row["data"]: float(row["total"]) for row in rows}
+    por_dia = {str(row["data"]): float(row["total"]) for row in rows}
     semanas: dict[str, float] = {}
     cursor = inicio
     while cursor <= fim:
@@ -830,17 +1103,29 @@ def faturamento_semanal(inicio: date, fim: date) -> list[dict[str, Any]]:
 
 def faturamento_mensal(ano: int) -> list[dict[str, Any]]:
     with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT substr(data, 1, 7) AS mes, SUM(valor) AS total
-            FROM financeiro
-            WHERE tipo = 'Receita' AND substr(data, 1, 4) = ?
-            GROUP BY mes
-            ORDER BY mes
-            """,
-            (str(ano),),
-        ).fetchall()
-    mapa = {row["mes"]: float(row["total"]) for row in rows}
+        if conn.is_postgres:
+            rows = conn.execute(
+                """
+                SELECT SUBSTRING(data FROM 1 FOR 7) AS mes, SUM(valor) AS total
+                FROM financeiro
+                WHERE tipo = 'Receita' AND SUBSTRING(data FROM 1 FOR 4) = %s
+                GROUP BY mes
+                ORDER BY mes
+                """,
+                (str(ano),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT substr(data, 1, 7) AS mes, SUM(valor) AS total
+                FROM financeiro
+                WHERE tipo = 'Receita' AND substr(data, 1, 4) = %s
+                GROUP BY mes
+                ORDER BY mes
+                """,
+                (str(ano),),
+            ).fetchall()
+    mapa = {str(row["mes"]): float(row["total"]) for row in rows}
     return [
         {"mes": f"{ano}-{mes:02d}", "total": mapa.get(f"{ano}-{mes:02d}", 0.0)}
         for mes in range(1, 13)
@@ -858,7 +1143,7 @@ def faturamento_por_servico(inicio: date, fim: date) -> list[dict[str, Any]]:
             FROM agendamentos a
             JOIN servicos s ON s.id = a.servico_id
             WHERE a.status = 'Concluído'
-              AND a.data_hora BETWEEN ? AND ?
+              AND a.data_hora BETWEEN %s AND %s
             GROUP BY s.id, s.nome
             ORDER BY total DESC
             """,
