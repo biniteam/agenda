@@ -325,3 +325,10 @@ def test_expansao_evento_recorrente_quinzenal():
     assert "2025-03-31 10:00:00" in datas
     assert "2025-03-10 10:00:00" not in datas
     assert "2025-03-24 10:00:00" not in datas
+
+def test_init_db_idempotent():
+    """Verifica se chamar init_db() múltiplas vezes é seguro e não causa erro."""
+    init_db()
+    init_db()
+    servicos = listar_servicos()
+    assert len(servicos) > 0
