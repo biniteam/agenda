@@ -2,11 +2,14 @@ import streamlit as st
 
 from database import (
     excluir_servico,
+    init_db,
     listar_servicos,
     obter_servico,
     salvar_servico,
 )
 from utils import formatar_moeda
+
+init_db()
 
 st.title("Serviços")
 

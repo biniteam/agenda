@@ -5,6 +5,7 @@ import streamlit as st
 from database import (
     excluir_cliente,
     excluir_pet,
+    init_db,
     listar_clientes,
     listar_pets,
     obter_cliente,
@@ -14,6 +15,8 @@ from database import (
     salvar_pet,
 )
 from utils import PORTES, formatar_moeda, hoje
+
+init_db()
 
 st.title("Clientes e Pets")
 

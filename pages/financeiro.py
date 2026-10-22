@@ -9,6 +9,7 @@ from database import (
     faturamento_mensal,
     faturamento_por_servico,
     faturamento_semanal,
+    init_db,
     listar_lancamentos,
     media_faturamento_dias_uteis,
     resumo_financeiro,
@@ -24,6 +25,8 @@ from utils import (
     hoje,
     inicio_semana,
 )
+
+init_db()
 
 st.title("Financeiro")
 

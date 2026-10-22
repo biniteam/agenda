@@ -9,6 +9,7 @@ from database import (
     atualizar_pago_agendamento,
     atualizar_status_agendamento,
     excluir_agendamento,
+    init_db,
     listar_agendamentos,
     listar_pets,
     listar_servicos,
@@ -28,6 +29,8 @@ from utils import (
     link_whatsapp,
     rotulo_mes,
 )
+
+init_db()
 
 calendar.setfirstweekday(calendar.MONDAY)
 
