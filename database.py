@@ -207,8 +207,13 @@ def get_connection() -> ConnectionWrapper:
             conn = psycopg2.connect(db_url)
             return ConnectionWrapper(conn, is_postgres=True)
         except Exception as e:
-            # Em caso de falha de conexão remota, fallback para SQLite local se apropriado
-            pass
+            msg = f"Não foi possível conectar ao Supabase. Usando SQLite local. Erro: {e}"
+            print(f"[DATABASE WARNING] {msg}")
+            if st is not None:
+                try:
+                    st.warning(msg)
+                except Exception:
+                    pass
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -220,7 +225,7 @@ def get_connection() -> ConnectionWrapper:
 def init_db() -> None:
     with get_connection() as conn:
         if conn.is_postgres:
-            conn.execute(
+            comandos = [
                 """
                 CREATE TABLE IF NOT EXISTS clientes (
                     id SERIAL PRIMARY KEY,
@@ -230,7 +235,8 @@ def init_db() -> None:
                     observacoes TEXT,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
-
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS pets (
                     id SERIAL PRIMARY KEY,
                     cliente_id INTEGER NOT NULL,
@@ -244,14 +250,16 @@ def init_db() -> None:
                     alergias_restricoes TEXT,
                     FOREIGN KEY (cliente_id) REFERENCES clientes(id)
                 );
-
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS servicos (
                     id SERIAL PRIMARY KEY,
                     nome TEXT NOT NULL,
                     preco_padrao REAL NOT NULL DEFAULT 0,
                     duracao_minutos INTEGER NOT NULL DEFAULT 60
                 );
-
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS agendamentos (
                     id SERIAL PRIMARY KEY,
                     pet_id INTEGER NOT NULL,
@@ -268,7 +276,8 @@ def init_db() -> None:
                     FOREIGN KEY (pet_id) REFERENCES pets(id),
                     FOREIGN KEY (servico_id) REFERENCES servicos(id)
                 );
-
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS financeiro (
                     id SERIAL PRIMARY KEY,
                     tipo TEXT NOT NULL,
@@ -279,8 +288,10 @@ def init_db() -> None:
                     agendamento_id INTEGER,
                     FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
                 );
-                """
-            )
+                """,
+            ]
+            for cmd in comandos:
+                conn.execute(cmd)
         else:
             conn.executescript(
                 """

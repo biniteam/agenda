@@ -332,3 +332,70 @@ def test_init_db_idempotent():
     init_db()
     servicos = listar_servicos()
     assert len(servicos) > 0
+
+
+def test_postgres_init_db_commands(monkeypatch):
+    """Verifica se os comandos CREATE TABLE para postgres são executados individualmente."""
+    executed_commands = []
+
+    class MockConn:
+        is_postgres = True
+
+        def execute(self, sql, params=()):
+            executed_commands.append(sql)
+            return self
+
+        def fetchone(self):
+            return {"cnt": 1}
+
+        def executemany(self, sql, params):
+            pass
+
+    class MockWrapper:
+        def __enter__(self):
+            return MockConn()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    monkeypatch.setattr("database.get_connection", lambda: MockWrapper())
+    monkeypatch.setattr("database._migrate_db", lambda conn: None)
+    monkeypatch.setattr("database._seed_servicos", lambda conn: None)
+
+    init_db()
+
+    assert len(executed_commands) == 5
+    assert "CREATE TABLE IF NOT EXISTS clientes" in executed_commands[0]
+    assert "CREATE TABLE IF NOT EXISTS pets" in executed_commands[1]
+    assert "CREATE TABLE IF NOT EXISTS servicos" in executed_commands[2]
+    assert "CREATE TABLE IF NOT EXISTS agendamentos" in executed_commands[3]
+    assert "CREATE TABLE IF NOT EXISTS financeiro" in executed_commands[4]
+
+
+def test_get_connection_fallback_warning(monkeypatch, capsys):
+    """Verifica se get_connection exibe aviso e faz fallback ao falhar a conexão com Postgres."""
+    monkeypatch.setattr("database._get_database_url", lambda: "postgresql://user:pass@invalid_host:5432/db")
+    monkeypatch.setattr("database.PSYCOPG2_AVAILABLE", True)
+
+    def mock_connect(url):
+        raise Exception("Connection failed test error")
+
+    monkeypatch.setattr("psycopg2.connect", mock_connect)
+
+    warnings = []
+    class MockSt:
+        @staticmethod
+        def warning(msg):
+            warnings.append(msg)
+
+    monkeypatch.setattr("database.st", MockSt)
+
+    conn = get_connection()
+    assert conn.is_postgres is False
+    assert len(warnings) == 1
+    assert "Não foi possível conectar ao Supabase" in warnings[0]
+    assert "Connection failed test error" in warnings[0]
+
+    captured = capsys.readouterr()
+    assert "[DATABASE WARNING]" in captured.out
+    assert "Connection failed test error" in captured.out
