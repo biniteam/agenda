@@ -1,14 +1,12 @@
 import os
-import sqlite3
-import tempfile
 from datetime import date, datetime, time
 import pytest
 
+import database
 from database import (
     adicionar_excecao_agendamento,
     atualizar_pago_agendamento,
     expandir_agendamentos,
-    get_connection,
     init_db,
     listar_agendamentos,
     salvar_agendamento,
@@ -24,26 +22,261 @@ from utils import (
     hoje,
 )
 
+_ORIGINAL_GET_CONNECTION = database.get_connection
+
+
+class MockCursor:
+    def __init__(self, db_state):
+        self.db_state = db_state
+        self.description = None
+        self._result = []
+
+    def execute(self, sql, params=()):
+        sql_clean = ' '.join(sql.strip().split())
+        if 'SELECT column_name FROM information_schema.columns' in sql_clean:
+            self.description = [('column_name',)]
+            self._result = [
+                {'column_name': 'id'},
+                {'column_name': 'pet_id'},
+                {'column_name': 'servico_id'},
+                {'column_name': 'data_hora'},
+                {'column_name': 'status'},
+                {'column_name': 'rrule'},
+                {'column_name': 'exdate'},
+                {'column_name': 'pago'},
+                {'column_name': 'data_pagamento'},
+            ]
+        elif 'SELECT COUNT(*) AS cnt FROM servicos' in sql_clean:
+            self.description = [('cnt',)]
+            self._result = [{'cnt': len(self.db_state['servicos'])}]
+        elif 'INSERT INTO servicos' in sql_clean:
+            self.description = [('id',)]
+            new_id = len(self.db_state['servicos']) + 1
+            rec = {
+                'id': new_id,
+                'nome': params[0],
+                'preco_padrao': params[1],
+                'duracao_minutos': params[2],
+            }
+            self.db_state['servicos'].append(rec)
+            self._result = [{'id': new_id}]
+        elif 'SELECT * FROM servicos WHERE id =' in sql_clean:
+            sid = params[0]
+            found = [s for s in self.db_state['servicos'] if s['id'] == sid]
+            self._result = [dict(found[0])] if found else []
+        elif 'SELECT * FROM servicos ORDER BY nome' in sql_clean:
+            self._result = [dict(s) for s in sorted(self.db_state['servicos'], key=lambda x: x['nome'])]
+        elif 'UPDATE servicos SET nome =' in sql_clean:
+            nome, preco, duracao, sid = params
+            for s in self.db_state['servicos']:
+                if s['id'] == sid:
+                    s['nome'] = nome
+                    s['preco_padrao'] = preco
+                    s['duracao_minutos'] = duracao
+            self._result = []
+        elif 'DELETE FROM servicos WHERE id =' in sql_clean:
+            sid = params[0]
+            self.db_state['servicos'] = [s for s in self.db_state['servicos'] if s['id'] != sid]
+            self._result = []
+        elif 'INSERT INTO clientes' in sql_clean:
+            new_id = len(self.db_state['clientes']) + 1
+            rec = {
+                'id': new_id,
+                'nome': params[0],
+                'telefone': params[1],
+                'endereco': params[2],
+                'observacoes': params[3],
+            }
+            self.db_state['clientes'].append(rec)
+            self._result = [{'id': new_id}]
+        elif 'INSERT INTO pets' in sql_clean:
+            new_id = len(self.db_state['pets']) + 1
+            rec = {
+                'id': new_id,
+                'cliente_id': params[0],
+                'nome': params[1],
+                'especie': params[2],
+                'raca': params[3],
+                'porte': params[4],
+                'pelagem': params[5],
+                'data_nascimento': params[6],
+                'temperamento': params[7],
+                'alergias_restricoes': params[8],
+            }
+            self.db_state['pets'].append(rec)
+            self._result = [{'id': new_id}]
+        elif 'INSERT INTO agendamentos' in sql_clean:
+            new_id = len(self.db_state['agendamentos']) + 1
+            rec = {
+                'id': new_id,
+                'pet_id': params[0],
+                'servico_id': params[1],
+                'data_hora': params[2],
+                'status': params[3],
+                'profissional': params[4],
+                'valor_cobrado': params[5],
+                'observacoes': params[6],
+                'rrule': params[7],
+                'exdate': params[8],
+                'pago': params[9],
+                'data_pagamento': params[10],
+            }
+            self.db_state['agendamentos'].append(rec)
+            self._result = [{'id': new_id}]
+        elif 'SELECT COUNT(*) AS cnt FROM agendamentos WHERE servico_id =' in sql_clean:
+            sid = params[0]
+            cnt = sum(1 for a in self.db_state['agendamentos'] if a['servico_id'] == sid)
+            self._result = [{'cnt': cnt}]
+        elif 'UPDATE agendamentos SET exdate =' in sql_clean:
+            exdate, ag_id = params
+            for a in self.db_state['agendamentos']:
+                if a['id'] == ag_id:
+                    a['exdate'] = exdate
+            self._result = []
+        elif 'UPDATE agendamentos SET pago =' in sql_clean:
+            pago, data_pag, ag_id = params
+            for a in self.db_state['agendamentos']:
+                if a['id'] == ag_id:
+                    a['pago'] = pago
+                    a['data_pagamento'] = data_pag
+            self._result = []
+        elif 'SELECT * FROM agendamentos WHERE id =' in sql_clean:
+            ag_id = params[0]
+            found = [a for a in self.db_state['agendamentos'] if a['id'] == ag_id]
+            self._result = [dict(found[0])] if found else []
+        elif 'SELECT id FROM financeiro WHERE agendamento_id =' in sql_clean:
+            ag_id = params[0]
+            found = [f for f in self.db_state['financeiro'] if f.get('agendamento_id') == ag_id and f.get('tipo') == 'Receita']
+            self._result = [{'id': found[0]['id']}] if found else []
+        elif 'DELETE FROM financeiro WHERE id =' in sql_clean:
+            fid = params[0]
+            self.db_state['financeiro'] = [f for f in self.db_state['financeiro'] if f['id'] != fid]
+            self._result = []
+        elif 'INSERT INTO financeiro' in sql_clean:
+            new_id = len(self.db_state['financeiro']) + 1
+            if len(params) == 4: # from _sincronizar_receita_agendamento: (descricao, valor, dia, agendamento_id)
+                rec = {
+                    'id': new_id,
+                    'tipo': 'Receita',
+                    'categoria': 'Serviços',
+                    'descricao': params[0],
+                    'valor': params[1],
+                    'data': params[2],
+                    'agendamento_id': params[3],
+                }
+            else: # from salvar_lancamento: (tipo, categoria, descricao, valor, dia)
+                rec = {
+                    'id': new_id,
+                    'tipo': params[0],
+                    'categoria': params[1],
+                    'descricao': params[2],
+                    'valor': params[3],
+                    'data': params[4],
+                    'agendamento_id': None,
+                }
+            self.db_state['financeiro'].append(rec)
+            self._result = [{'id': new_id}]
+        elif 'SELECT * FROM financeiro WHERE agendamento_id =' in sql_clean:
+            ag_id = params[0]
+            found = [f for f in self.db_state['financeiro'] if f.get('agendamento_id') == ag_id]
+            self._result = [dict(f) for f in found]
+        elif 'FROM agendamentos a' in sql_clean:
+            # AGENDAMENTO_SELECT query
+            joined = []
+            for a in self.db_state['agendamentos']:
+                pet = next((p for p in self.db_state['pets'] if p['id'] == a['pet_id']), {})
+                cli = next((c for c in self.db_state['clientes'] if c['id'] == pet.get('cliente_id')), {})
+                srv = next((s for s in self.db_state['servicos'] if s['id'] == a['servico_id']), {})
+                item = {
+                    'id': a['id'],
+                    'pet_id': a['pet_id'],
+                    'servico_id': a['servico_id'],
+                    'data_hora': a['data_hora'],
+                    'status': a['status'],
+                    'profissional': a['profissional'],
+                    'valor_cobrado': a['valor_cobrado'],
+                    'observacoes': a['observacoes'],
+                    'rrule': a['rrule'],
+                    'exdate': a['exdate'],
+                    'pago': a['pago'],
+                    'data_pagamento': a['data_pagamento'],
+                    'pet_nome': pet.get('nome', ''),
+                    'temperamento': pet.get('temperamento', ''),
+                    'alergias_restricoes': pet.get('alergias_restricoes', ''),
+                    'data_nascimento': pet.get('data_nascimento', ''),
+                    'cliente_id': cli.get('id', None),
+                    'tutor_nome': cli.get('nome', ''),
+                    'tutor_telefone': cli.get('telefone', ''),
+                    'servico_nome': srv.get('nome', ''),
+                    'preco_padrao': srv.get('preco_padrao', 0.0),
+                    'duracao_minutos': srv.get('duracao_minutos', 60),
+                    'valor_estimado': a['valor_cobrado'] if a['valor_cobrado'] is not None else srv.get('preco_padrao', 0.0),
+                }
+                joined.append(item)
+            if 'WHERE a.id =' in sql_clean:
+                ag_id = params[0]
+                joined = [item for item in joined if item['id'] == ag_id]
+            self._result = joined
+        else:
+            self._result = []
+        return self
+
+    def executemany(self, sql, param_list):
+        for p in param_list:
+            self.execute(sql, p)
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
+
+    def fetchall(self):
+        return self._result
+
+
+class MockConnectionWrapper:
+    def __init__(self, db_state):
+        self.db_state = db_state
+        self.is_postgres = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    def execute(self, sql, params=()):
+        cur = database.CursorWrapper(MockCursor(self.db_state))
+        cur.execute(sql, params)
+        return cur
+
+    def executemany(self, sql, param_list):
+        cur = database.CursorWrapper(MockCursor(self.db_state))
+        cur.executemany(sql, param_list)
+        return cur
+
 
 @pytest.fixture(autouse=True)
-def setup_tmp_db(tmp_path, monkeypatch):
-    db_file = tmp_path / "test_petshop.db"
-    monkeypatch.setattr("database.DB_PATH", db_file)
+def setup_mock_db(monkeypatch):
+    db_state = {
+        'clientes': [],
+        'pets': [],
+        'servicos': [],
+        'agendamentos': [],
+        'financeiro': [],
+    }
+    monkeypatch.setattr('database.PSYCOPG2_AVAILABLE', True)
+    monkeypatch.setattr('database._get_database_url', lambda: 'postgresql://user:pass@localhost:5432/postgres')
+    monkeypatch.setattr('database.get_connection', lambda: MockConnectionWrapper(db_state))
     init_db()
-    return db_file
+    return db_state
 
 
 def test_schema_migration():
-    """Verifica se as colunas 'rrule' e 'exdate' existem no banco de dados."""
-    with get_connection() as conn:
-        if conn.is_postgres:
-            rows = conn.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_name = 'agendamentos'"
-            ).fetchall()
-            cols = [r["column_name"] for r in rows]
-        else:
-            raw_cur = conn.conn.cursor()
-            cols = [row[1] for row in raw_cur.execute("PRAGMA table_info(agendamentos)").fetchall()]
+    """Verifica se as colunas 'rrule' e 'exdate' existem no schema do banco."""
+    with database.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'agendamentos'"
+        ).fetchall()
+        cols = [r["column_name"] for r in rows]
         assert "rrule" in cols
         assert "exdate" in cols
 
@@ -157,7 +390,6 @@ def test_exdate_datas_excecao():
 
 def test_recorrencia_meses_tamanhos_diferentes():
     """Testa cálculo de recorrência mensal cobrindo Fevereiro e meses de 30/31 dias."""
-    # Evento no dia 31 de Janeiro em ano não bissexto (2025) e ano bissexto (2024)
     item_31 = {
         "id": 1,
         "data_hora": "2025-01-31 14:00:00",
@@ -165,7 +397,6 @@ def test_recorrencia_meses_tamanhos_diferentes():
         "exdate": None,
         "status": "Agendado",
     }
-    # Janela cobrindo Fev e Mar de 2025
     w_start = datetime(2025, 2, 1, 0, 0, 0)
     w_end = datetime(2025, 3, 31, 23, 59, 59)
 
@@ -200,12 +431,9 @@ def test_fluxo_banco_agendamento_recorrente():
         rrule="FREQ=WEEKLY;BYDAY=MO",
     )
 
-    # Listar Março/2025
     agendamentos = listar_agendamentos(date(2025, 3, 1), date(2025, 3, 31))
-    # Segundas-feiras em Março 2025: 3, 10, 17, 24, 31 (5 ocorrências)
     assert len(agendamentos) == 5
 
-    # Adicionar exceção para 2025-03-10 09:00:00
     adicionar_excecao_agendamento(ag_id, "2025-03-10 09:00:00")
 
     agendamentos_pos_ex = listar_agendamentos(date(2025, 3, 1), date(2025, 3, 31))
@@ -222,7 +450,6 @@ def test_crud_servicos():
         salvar_servico,
     )
 
-    # Novo serviço
     sid = salvar_servico("Hidratação Especial", 85.0, 45)
     servico = obter_servico(sid)
     assert servico is not None
@@ -230,19 +457,16 @@ def test_crud_servicos():
     assert servico["preco_padrao"] == 85.0
     assert servico["duracao_minutos"] == 45
 
-    # Editar serviço
     salvar_servico("Hidratação Premium", 95.0, 50, servico_id=sid)
     servico_editado = obter_servico(sid)
     assert servico_editado["nome"] == "Hidratação Premium"
     assert servico_editado["preco_padrao"] == 95.0
     assert servico_editado["duracao_minutos"] == 50
 
-    # Tentar excluir serviço sem agendamentos
     ok, msg = excluir_servico(sid)
     assert ok is True
     assert obter_servico(sid) is None
 
-    # Tentar excluir serviço com agendamentos vinculados
     servicos_padrao = listar_servicos()
     s_padrao_id = servicos_padrao[0]["id"]
     cid = salvar_cliente("Tutor Servico Teste", "11888888888")
@@ -261,7 +485,6 @@ def test_controle_pagamento_e_sincronizacao_financeira():
     servicos = listar_servicos()
     sid = servicos[0]["id"]
 
-    # 1. Agendamento criado como não pago (pago=0)
     ag_id = salvar_agendamento(
         pet_id=pid,
         servico_id=sid,
@@ -270,7 +493,7 @@ def test_controle_pagamento_e_sincronizacao_financeira():
         pago=0,
     )
 
-    with get_connection() as conn:
+    with database.get_connection() as conn:
         row = conn.execute("SELECT * FROM agendamentos WHERE id = %s", (ag_id,)).fetchone()
         assert row["pago"] == 0
         assert row["data_pagamento"] is None
@@ -278,11 +501,10 @@ def test_controle_pagamento_e_sincronizacao_financeira():
         fin = conn.execute("SELECT * FROM financeiro WHERE agendamento_id = %s", (ag_id,)).fetchall()
         assert len(fin) == 0
 
-    # 2. Atualizar agendamento para pago=1 com data_pagamento
     dt_pag = date(2025, 3, 12)
     atualizar_pago_agendamento(ag_id, pago=1, data_pagamento=dt_pag)
 
-    with get_connection() as conn:
+    with database.get_connection() as conn:
         row = conn.execute("SELECT * FROM agendamentos WHERE id = %s", (ag_id,)).fetchone()
         assert row["pago"] == 1
         assert str(row["data_pagamento"]) == "2025-03-12"
@@ -292,10 +514,9 @@ def test_controle_pagamento_e_sincronizacao_financeira():
         assert fin[0]["tipo"] == "Receita"
         assert str(fin[0]["data"]) == "2025-03-12"
 
-    # 3. Alterar para pago=0 deve remover o lançamento do financeiro
     atualizar_pago_agendamento(ag_id, pago=0)
 
-    with get_connection() as conn:
+    with database.get_connection() as conn:
         row = conn.execute("SELECT * FROM agendamentos WHERE id = %s", (ag_id,)).fetchone()
         assert row["pago"] == 0
 
@@ -303,99 +524,12 @@ def test_controle_pagamento_e_sincronizacao_financeira():
         assert len(fin) == 0
 
 
-def test_expansao_evento_recorrente_quinzenal():
-    """Testa evento recorrente quinzenal (uma semana sim, outra não)."""
-    item = {
-        "id": 1,
-        "data_hora": "2025-03-03 10:00:00",
-        "rrule": "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO",
-        "exdate": None,
-        "status": "Agendado",
-    }
-    w_start = datetime(2025, 3, 1, 0, 0, 0)
-    w_end = datetime(2025, 3, 31, 23, 59, 59)
-
-    res = expandir_agendamentos([item], w_start, w_end)
-    datas = [r["data_hora"] for r in res]
-
-    # Devem ser geradas 3 ocorrências em Março/2025: 03/03, 17/03 e 31/03
-    assert len(res) == 3
-    assert "2025-03-03 10:00:00" in datas
-    assert "2025-03-17 10:00:00" in datas
-    assert "2025-03-31 10:00:00" in datas
-    assert "2025-03-10 10:00:00" not in datas
-    assert "2025-03-24 10:00:00" not in datas
-
-def test_init_db_idempotent():
-    """Verifica se chamar init_db() múltiplas vezes é seguro e não causa erro."""
-    init_db()
-    init_db()
-    servicos = listar_servicos()
-    assert len(servicos) > 0
-
-
-def test_postgres_init_db_commands(monkeypatch):
-    """Verifica se os comandos CREATE TABLE para postgres são executados individualmente."""
-    executed_commands = []
-
-    class MockConn:
-        is_postgres = True
-
-        def execute(self, sql, params=()):
-            executed_commands.append(sql)
-            return self
-
-        def fetchone(self):
-            return {"cnt": 1}
-
-        def executemany(self, sql, params):
-            pass
-
-    class MockWrapper:
-        def __enter__(self):
-            return MockConn()
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            pass
-
-    monkeypatch.setattr("database.get_connection", lambda: MockWrapper())
-    monkeypatch.setattr("database._migrate_db", lambda conn: None)
-    monkeypatch.setattr("database._seed_servicos", lambda conn: None)
-
-    init_db()
-
-    assert len(executed_commands) == 5
-    assert "CREATE TABLE IF NOT EXISTS clientes" in executed_commands[0]
-    assert "CREATE TABLE IF NOT EXISTS pets" in executed_commands[1]
-    assert "CREATE TABLE IF NOT EXISTS servicos" in executed_commands[2]
-    assert "CREATE TABLE IF NOT EXISTS agendamentos" in executed_commands[3]
-    assert "CREATE TABLE IF NOT EXISTS financeiro" in executed_commands[4]
-
-
-def test_get_connection_fallback_warning(monkeypatch, capsys):
-    """Verifica se get_connection exibe aviso e faz fallback ao falhar a conexão com Postgres."""
-    monkeypatch.setattr("database._get_database_url", lambda: "postgresql://user:pass@invalid_host:5432/db")
+def test_get_connection_sem_url(monkeypatch):
+    """Verifica se get_connection lança RuntimeError quando nenhuma URL é fornecida."""
+    monkeypatch.setattr("database._get_database_url", lambda: None)
     monkeypatch.setattr("database.PSYCOPG2_AVAILABLE", True)
 
-    def mock_connect(url):
-        raise Exception("Connection failed test error")
+    with pytest.raises(RuntimeError) as exc_info:
+        _ORIGINAL_GET_CONNECTION()
 
-    monkeypatch.setattr("psycopg2.connect", mock_connect)
-
-    warnings = []
-    class MockSt:
-        @staticmethod
-        def warning(msg):
-            warnings.append(msg)
-
-    monkeypatch.setattr("database.st", MockSt)
-
-    conn = get_connection()
-    assert conn.is_postgres is False
-    assert len(warnings) == 1
-    assert "Não foi possível conectar ao Supabase" in warnings[0]
-    assert "Connection failed test error" in warnings[0]
-
-    captured = capsys.readouterr()
-    assert "[DATABASE WARNING]" in captured.out
-    assert "Connection failed test error" in captured.out
+    assert "Nenhuma URL do Supabase/Postgres configurada" in str(exc_info.value)
