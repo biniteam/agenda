@@ -204,7 +204,14 @@ def get_connection() -> ConnectionWrapper:
     db_url = _get_database_url()
     if db_url and PSYCOPG2_AVAILABLE:
         try:
+            print("[DATABASE LOG] Tentando conectar ao Supabase/Postgres...")
             conn = psycopg2.connect(db_url)
+            print("[DATABASE LOG] Conexão com Supabase/Postgres estabelecida com sucesso!")
+            if st is not None:
+                try:
+                    st.info("[DATABASE LOG] Conectado ao Supabase/Postgres com sucesso.")
+                except Exception:
+                    pass
             return ConnectionWrapper(conn, is_postgres=True)
         except Exception as e:
             msg = f"Não foi possível conectar ao Supabase. Usando SQLite local. Erro: {e}"
@@ -214,6 +221,17 @@ def get_connection() -> ConnectionWrapper:
                     st.warning(msg)
                 except Exception:
                     pass
+    elif db_url and not PSYCOPG2_AVAILABLE:
+        msg = "DATABASE_URL configurada, mas psycopg2 não está disponível. Usando SQLite local."
+        print(f"[DATABASE WARNING] {msg}")
+        if st is not None:
+            try:
+                st.warning(msg)
+            except Exception:
+                pass
+    else:
+        msg = "Nenhuma URL do Supabase/Postgres configurada. Usando SQLite local."
+        print(f"[DATABASE LOG] {msg}")
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -223,170 +241,245 @@ def get_connection() -> ConnectionWrapper:
 
 
 def init_db() -> None:
-    with get_connection() as conn:
-        if conn.is_postgres:
-            comandos = [
-                """
-                CREATE TABLE IF NOT EXISTS clientes (
-                    id SERIAL PRIMARY KEY,
-                    nome TEXT NOT NULL,
-                    telefone TEXT,
-                    endereco TEXT,
-                    observacoes TEXT,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS pets (
-                    id SERIAL PRIMARY KEY,
-                    cliente_id INTEGER NOT NULL,
-                    nome TEXT NOT NULL,
-                    especie TEXT,
-                    raca TEXT,
-                    porte TEXT,
-                    pelagem TEXT,
-                    data_nascimento TEXT,
-                    temperamento TEXT,
-                    alergias_restricoes TEXT,
-                    FOREIGN KEY (cliente_id) REFERENCES clientes(id)
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS servicos (
-                    id SERIAL PRIMARY KEY,
-                    nome TEXT NOT NULL,
-                    preco_padrao REAL NOT NULL DEFAULT 0,
-                    duracao_minutos INTEGER NOT NULL DEFAULT 60
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS agendamentos (
-                    id SERIAL PRIMARY KEY,
-                    pet_id INTEGER NOT NULL,
-                    servico_id INTEGER NOT NULL,
-                    data_hora TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'Agendado',
-                    profissional TEXT,
-                    valor_cobrado REAL,
-                    observacoes TEXT,
-                    rrule TEXT DEFAULT NULL,
-                    exdate TEXT DEFAULT NULL,
-                    pago INTEGER NOT NULL DEFAULT 0,
-                    data_pagamento TEXT DEFAULT NULL,
-                    FOREIGN KEY (pet_id) REFERENCES pets(id),
-                    FOREIGN KEY (servico_id) REFERENCES servicos(id)
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS financeiro (
-                    id SERIAL PRIMARY KEY,
-                    tipo TEXT NOT NULL,
-                    categoria TEXT,
-                    descricao TEXT,
-                    valor REAL NOT NULL,
-                    data TEXT NOT NULL,
-                    agendamento_id INTEGER,
-                    FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
-                );
-                """,
-            ]
-            for cmd in comandos:
-                conn.execute(cmd)
-        else:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS clientes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nome TEXT NOT NULL,
-                    telefone TEXT,
-                    endereco TEXT,
-                    observacoes TEXT,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-                );
+    print("[DATABASE LOG] Iniciando inicialização do banco de dados (init_db)...")
+    if st is not None:
+        try:
+            st.info("[DATABASE LOG] Iniciando inicialização do banco de dados (init_db)...")
+        except Exception:
+            pass
 
-                CREATE TABLE IF NOT EXISTS pets (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cliente_id INTEGER NOT NULL,
-                    nome TEXT NOT NULL,
-                    especie TEXT,
-                    raca TEXT,
-                    porte TEXT,
-                    pelagem TEXT,
-                    data_nascimento TEXT,
-                    temperamento TEXT,
-                    alergias_restricoes TEXT,
-                    FOREIGN KEY (cliente_id) REFERENCES clientes(id)
-                );
+    try:
+        with get_connection() as conn:
+            db_type = "PostgreSQL (Supabase)" if conn.is_postgres else "SQLite"
+            print(f"[DATABASE LOG] Criando schema no banco de dados tipo: {db_type}")
 
-                CREATE TABLE IF NOT EXISTS servicos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nome TEXT NOT NULL,
-                    preco_padrao REAL NOT NULL DEFAULT 0,
-                    duracao_minutos INTEGER NOT NULL DEFAULT 60
-                );
+            if conn.is_postgres:
+                comandos = [
+                    ("clientes", """
+                    CREATE TABLE IF NOT EXISTS clientes (
+                        id SERIAL PRIMARY KEY,
+                        nome TEXT NOT NULL,
+                        telefone TEXT,
+                        endereco TEXT,
+                        observacoes TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """),
+                    ("pets", """
+                    CREATE TABLE IF NOT EXISTS pets (
+                        id SERIAL PRIMARY KEY,
+                        cliente_id INTEGER NOT NULL,
+                        nome TEXT NOT NULL,
+                        especie TEXT,
+                        raca TEXT,
+                        porte TEXT,
+                        pelagem TEXT,
+                        data_nascimento TEXT,
+                        temperamento TEXT,
+                        alergias_restricoes TEXT,
+                        FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+                    );
+                    """),
+                    ("servicos", """
+                    CREATE TABLE IF NOT EXISTS servicos (
+                        id SERIAL PRIMARY KEY,
+                        nome TEXT NOT NULL,
+                        preco_padrao REAL NOT NULL DEFAULT 0,
+                        duracao_minutos INTEGER NOT NULL DEFAULT 60
+                    );
+                    """),
+                    ("agendamentos", """
+                    CREATE TABLE IF NOT EXISTS agendamentos (
+                        id SERIAL PRIMARY KEY,
+                        pet_id INTEGER NOT NULL,
+                        servico_id INTEGER NOT NULL,
+                        data_hora TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'Agendado',
+                        profissional TEXT,
+                        valor_cobrado REAL,
+                        observacoes TEXT,
+                        rrule TEXT DEFAULT NULL,
+                        exdate TEXT DEFAULT NULL,
+                        pago INTEGER NOT NULL DEFAULT 0,
+                        data_pagamento TEXT DEFAULT NULL,
+                        FOREIGN KEY (pet_id) REFERENCES pets(id),
+                        FOREIGN KEY (servico_id) REFERENCES servicos(id)
+                    );
+                    """),
+                    ("financeiro", """
+                    CREATE TABLE IF NOT EXISTS financeiro (
+                        id SERIAL PRIMARY KEY,
+                        tipo TEXT NOT NULL,
+                        categoria TEXT,
+                        descricao TEXT,
+                        valor REAL NOT NULL,
+                        data TEXT NOT NULL,
+                        agendamento_id INTEGER,
+                        FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
+                    );
+                    """),
+                ]
+                for nome_tabela, cmd in comandos:
+                    try:
+                        print(f"[DATABASE LOG] Executando CREATE TABLE para '{nome_tabela}'...")
+                        conn.execute(cmd)
+                        print(f"[DATABASE LOG] Tabela '{nome_tabela}' criada ou já existente com sucesso.")
+                    except Exception as err:
+                        error_msg = f"[DATABASE ERROR] Erro ao criar tabela '{nome_tabela}' no Postgres: {err}"
+                        print(error_msg)
+                        if st is not None:
+                            try:
+                                st.error(error_msg)
+                            except Exception:
+                                pass
+                        raise err
+            else:
+                try:
+                    print("[DATABASE LOG] Executando script CREATE TABLE para SQLite...")
+                    conn.executescript(
+                        """
+                        CREATE TABLE IF NOT EXISTS clientes (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            nome TEXT NOT NULL,
+                            telefone TEXT,
+                            endereco TEXT,
+                            observacoes TEXT,
+                            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+                        );
 
-                CREATE TABLE IF NOT EXISTS agendamentos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pet_id INTEGER NOT NULL,
-                    servico_id INTEGER NOT NULL,
-                    data_hora TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'Agendado',
-                    profissional TEXT,
-                    valor_cobrado REAL,
-                    observacoes TEXT,
-                    rrule TEXT DEFAULT NULL,
-                    exdate TEXT DEFAULT NULL,
-                    pago INTEGER NOT NULL DEFAULT 0,
-                    data_pagamento TEXT DEFAULT NULL,
-                    FOREIGN KEY (pet_id) REFERENCES pets(id),
-                    FOREIGN KEY (servico_id) REFERENCES servicos(id)
-                );
+                        CREATE TABLE IF NOT EXISTS pets (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            cliente_id INTEGER NOT NULL,
+                            nome TEXT NOT NULL,
+                            especie TEXT,
+                            raca TEXT,
+                            porte TEXT,
+                            pelagem TEXT,
+                            data_nascimento TEXT,
+                            temperamento TEXT,
+                            alergias_restricoes TEXT,
+                            FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+                        );
 
-                CREATE TABLE IF NOT EXISTS financeiro (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tipo TEXT NOT NULL,
-                    categoria TEXT,
-                    descricao TEXT,
-                    valor REAL NOT NULL,
-                    data TEXT NOT NULL,
-                    agendamento_id INTEGER,
-                    FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
-                );
-                """
-            )
-        _migrate_db(conn)
-        _seed_servicos(conn)
+                        CREATE TABLE IF NOT EXISTS servicos (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            nome TEXT NOT NULL,
+                            preco_padrao REAL NOT NULL DEFAULT 0,
+                            duracao_minutos INTEGER NOT NULL DEFAULT 60
+                        );
+
+                        CREATE TABLE IF NOT EXISTS agendamentos (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            pet_id INTEGER NOT NULL,
+                            servico_id INTEGER NOT NULL,
+                            data_hora TEXT NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'Agendado',
+                            profissional TEXT,
+                            valor_cobrado REAL,
+                            observacoes TEXT,
+                            rrule TEXT DEFAULT NULL,
+                            exdate TEXT DEFAULT NULL,
+                            pago INTEGER NOT NULL DEFAULT 0,
+                            data_pagamento TEXT DEFAULT NULL,
+                            FOREIGN KEY (pet_id) REFERENCES pets(id),
+                            FOREIGN KEY (servico_id) REFERENCES servicos(id)
+                        );
+
+                        CREATE TABLE IF NOT EXISTS financeiro (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            tipo TEXT NOT NULL,
+                            categoria TEXT,
+                            descricao TEXT,
+                            valor REAL NOT NULL,
+                            data TEXT NOT NULL,
+                            agendamento_id INTEGER,
+                            FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
+                        );
+                        """
+                    )
+                    print("[DATABASE LOG] Tabelas SQLite criadas ou já existentes com sucesso.")
+                except Exception as err:
+                    error_msg = f"[DATABASE ERROR] Erro ao criar tabelas no SQLite: {err}"
+                    print(error_msg)
+                    if st is not None:
+                        try:
+                            st.error(error_msg)
+                        except Exception:
+                            pass
+                    raise err
+
+            _migrate_db(conn)
+            _seed_servicos(conn)
+            print("[DATABASE LOG] Inicialização do banco de dados concluída com sucesso!")
+            if st is not None:
+                try:
+                    st.success("[DATABASE LOG] Inicialização do banco de dados concluída com sucesso!")
+                except Exception:
+                    pass
+    except Exception as e:
+        final_err_msg = f"[DATABASE ERROR] Falha geral ao inicializar o banco de dados: {e}"
+        print(final_err_msg)
+        if st is not None:
+            try:
+                st.error(final_err_msg)
+            except Exception:
+                pass
 
 
 def _migrate_db(conn: ConnectionWrapper) -> None:
-    if conn.is_postgres:
-        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS rrule TEXT DEFAULT NULL")
-        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS exdate TEXT DEFAULT NULL")
-        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS pago INTEGER NOT NULL DEFAULT 0")
-        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS data_pagamento TEXT DEFAULT NULL")
-    else:
-        # SQLite
-        raw_cur = conn.conn.cursor()
-        columns = [row[1] for row in raw_cur.execute("PRAGMA table_info(agendamentos)").fetchall()]
-        if "rrule" not in columns:
-            conn.execute("ALTER TABLE agendamentos ADD COLUMN rrule TEXT DEFAULT NULL")
-        if "exdate" not in columns:
-            conn.execute("ALTER TABLE agendamentos ADD COLUMN exdate TEXT DEFAULT NULL")
-        if "pago" not in columns:
-            conn.execute("ALTER TABLE agendamentos ADD COLUMN pago INTEGER NOT NULL DEFAULT 0")
-        if "data_pagamento" not in columns:
-            conn.execute("ALTER TABLE agendamentos ADD COLUMN data_pagamento TEXT DEFAULT NULL")
+    print("[DATABASE LOG] Verificando migrations do banco de dados...")
+    try:
+        if conn.is_postgres:
+            conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS rrule TEXT DEFAULT NULL")
+            conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS exdate TEXT DEFAULT NULL")
+            conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS pago INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS data_pagamento TEXT DEFAULT NULL")
+        else:
+            # SQLite
+            raw_cur = conn.conn.cursor()
+            columns = [row[1] for row in raw_cur.execute("PRAGMA table_info(agendamentos)").fetchall()]
+            if "rrule" not in columns:
+                conn.execute("ALTER TABLE agendamentos ADD COLUMN rrule TEXT DEFAULT NULL")
+            if "exdate" not in columns:
+                conn.execute("ALTER TABLE agendamentos ADD COLUMN exdate TEXT DEFAULT NULL")
+            if "pago" not in columns:
+                conn.execute("ALTER TABLE agendamentos ADD COLUMN pago INTEGER NOT NULL DEFAULT 0")
+            if "data_pagamento" not in columns:
+                conn.execute("ALTER TABLE agendamentos ADD COLUMN data_pagamento TEXT DEFAULT NULL")
+        print("[DATABASE LOG] Migrations concluídas com sucesso.")
+    except Exception as err:
+        msg = f"[DATABASE ERROR] Erro durante migrations (_migrate_db): {err}"
+        print(msg)
+        if st is not None:
+            try:
+                st.error(msg)
+            except Exception:
+                pass
+        raise err
 
 
 def _seed_servicos(conn: ConnectionWrapper) -> None:
-    res = conn.execute("SELECT COUNT(*) AS cnt FROM servicos").fetchone()
-    count = res["cnt"] if res and "cnt" in res else (list(res.values())[0] if res else 0)
-    if count:
-        return
-    conn.executemany(
-        "INSERT INTO servicos (nome, preco_padrao, duracao_minutos) VALUES (%s, %s, %s)",
-        SERVICOS_PADRAO,
-    )
+    print("[DATABASE LOG] Verificando população inicial de serviços (_seed_servicos)...")
+    try:
+        res = conn.execute("SELECT COUNT(*) AS cnt FROM servicos").fetchone()
+        count = res["cnt"] if res and "cnt" in res else (list(res.values())[0] if res else 0)
+        if count:
+            print(f"[DATABASE LOG] Tabela 'servicos' já possui {count} registros. Seed ignorado.")
+            return
+        conn.executemany(
+            "INSERT INTO servicos (nome, preco_padrao, duracao_minutos) VALUES (%s, %s, %s)",
+            SERVICOS_PADRAO,
+        )
+        print("[DATABASE LOG] Serviços padrão inseridos com sucesso.")
+    except Exception as err:
+        msg = f"[DATABASE ERROR] Erro durante população inicial (_seed_servicos): {err}"
+        print(msg)
+        if st is not None:
+            try:
+                st.error(msg)
+            except Exception:
+                pass
+        raise err
 
 
 def _as_dict(row: Any) -> dict[str, Any] | None:
