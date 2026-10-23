@@ -1,9 +1,8 @@
-"""Conexão PostgreSQL / Supabase (com suporte a SQLite para testes), schema e consultas do pet shop."""
+"""Conexão PostgreSQL / Supabase, schema e consultas do pet shop."""
 
 from __future__ import annotations
 
 import os
-import sqlite3
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,8 +22,6 @@ except ImportError:
     PSYCOPG2_AVAILABLE = False
 
 ROOT_DIR = Path(__file__).resolve().parent
-DATA_DIR = ROOT_DIR / "data"
-DB_PATH = DATA_DIR / "petshop.db"
 
 SERVICOS_PADRAO = (
     ("Banho", 50.0, 60),
@@ -101,26 +98,17 @@ def _get_database_url() -> str | None:
 
 
 class CursorWrapper:
-    """Wrapper unificado para tratar diferenças entre psycopg2 e sqlite3 cursors."""
+    """Wrapper para tratar consultas com cursor de psycopg2."""
 
-    def __init__(self, cursor: Any, is_postgres: bool):
+    def __init__(self, cursor: Any):
         self.cursor = cursor
-        self.is_postgres = is_postgres
 
     def execute(self, sql: str, params: tuple | list | dict = ()) -> CursorWrapper:
-        if not self.is_postgres:
-            sql = sql.replace("%s", "?")
-            self.cursor.execute(sql, params)
-        else:
-            self.cursor.execute(sql, params)
+        self.cursor.execute(sql, params)
         return self
 
     def executemany(self, sql: str, param_list: list) -> CursorWrapper:
-        if not self.is_postgres:
-            sql = sql.replace("%s", "?")
-            self.cursor.executemany(sql, param_list)
-        else:
-            self.cursor.executemany(sql, param_list)
+        self.cursor.executemany(sql, param_list)
         return self
 
     def fetchone(self) -> dict[str, Any] | None:
@@ -132,7 +120,6 @@ class CursorWrapper:
         if hasattr(row, "keys"):
             return dict(row)
         if isinstance(row, (list, tuple)):
-            # Se for tuple sem keys (ex COUNT(*)), mapeia se tiver descrição
             if self.cursor.description:
                 cols = [desc[0] for desc in self.cursor.description]
                 return dict(zip(cols, row))
@@ -151,19 +138,13 @@ class CursorWrapper:
             return [dict(zip(cols, r)) for r in rows]
         return rows
 
-    @property
-    def lastrowid(self) -> int | None:
-        if hasattr(self.cursor, "lastrowid"):
-            return self.cursor.lastrowid
-        return None
-
 
 class ConnectionWrapper:
-    """Wrapper de conexão unificado com autocommit/commit context management."""
+    """Wrapper de conexão PostgreSQL com autocommit/commit context management."""
 
-    def __init__(self, conn: Any, is_postgres: bool):
+    def __init__(self, conn: Any):
         self.conn = conn
-        self.is_postgres = is_postgres
+        self.is_postgres = True
 
     def __enter__(self) -> ConnectionWrapper:
         return self
@@ -176,11 +157,8 @@ class ConnectionWrapper:
         self.conn.close()
 
     def cursor(self) -> CursorWrapper:
-        if self.is_postgres:
-            cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        else:
-            cur = self.conn.cursor()
-        return CursorWrapper(cur, self.is_postgres)
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        return CursorWrapper(cur)
 
     def execute(self, sql: str, params: tuple | list | dict = ()) -> CursorWrapper:
         cur = self.cursor()
@@ -194,50 +172,40 @@ class ConnectionWrapper:
 
     def executescript(self, script: str) -> None:
         cur = self.conn.cursor()
-        if self.is_postgres:
-            cur.execute(script)
-        else:
-            cur.executescript(script)
+        cur.execute(script)
 
 
 def get_connection() -> ConnectionWrapper:
+    if not PSYCOPG2_AVAILABLE:
+        msg = "psycopg2 não está disponível. Certifique-se de ter psycopg2-binary instalado."
+        print(f"[DATABASE ERROR] {msg}")
+        raise RuntimeError(msg)
+
     db_url = _get_database_url()
-    if db_url and PSYCOPG2_AVAILABLE:
-        try:
-            print("[DATABASE LOG] Tentando conectar ao Supabase/Postgres...")
-            conn = psycopg2.connect(db_url)
-            print("[DATABASE LOG] Conexão com Supabase/Postgres estabelecida com sucesso!")
-            if st is not None:
-                try:
-                    st.info("[DATABASE LOG] Conectado ao Supabase/Postgres com sucesso.")
-                except Exception:
-                    pass
-            return ConnectionWrapper(conn, is_postgres=True)
-        except Exception as e:
-            msg = f"Não foi possível conectar ao Supabase. Usando SQLite local. Erro: {e}"
-            print(f"[DATABASE WARNING] {msg}")
-            if st is not None:
-                try:
-                    st.warning(msg)
-                except Exception:
-                    pass
-    elif db_url and not PSYCOPG2_AVAILABLE:
-        msg = "DATABASE_URL configurada, mas psycopg2 não está disponível. Usando SQLite local."
-        print(f"[DATABASE WARNING] {msg}")
+    if not db_url:
+        msg = "Nenhuma URL do Supabase/Postgres configurada."
+        print(f"[DATABASE ERROR] {msg}")
+        raise RuntimeError(msg)
+
+    try:
+        print("[DATABASE LOG] Conectando ao Supabase/Postgres...")
+        conn = psycopg2.connect(db_url)
+        print("[DATABASE LOG] Conexão com Supabase/Postgres estabelecida com sucesso!")
         if st is not None:
             try:
-                st.warning(msg)
+                st.info("[DATABASE LOG] Conectado ao Supabase/Postgres com sucesso.")
             except Exception:
                 pass
-    else:
-        msg = "Nenhuma URL do Supabase/Postgres configurada. Usando SQLite local."
-        print(f"[DATABASE LOG] {msg}")
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return ConnectionWrapper(conn, is_postgres=False)
+        return ConnectionWrapper(conn)
+    except Exception as e:
+        msg = f"Falha ao conectar ao Supabase/Postgres: {e}"
+        print(f"[DATABASE ERROR] {msg}")
+        if st is not None:
+            try:
+                st.error(msg)
+            except Exception:
+                pass
+        raise RuntimeError(msg) from e
 
 
 def init_db() -> None:
@@ -250,156 +218,80 @@ def init_db() -> None:
 
     try:
         with get_connection() as conn:
-            db_type = "PostgreSQL (Supabase)" if conn.is_postgres else "SQLite"
-            print(f"[DATABASE LOG] Criando schema no banco de dados tipo: {db_type}")
+            print("[DATABASE LOG] Criando schema no banco de dados PostgreSQL (Supabase)...")
 
-            if conn.is_postgres:
-                comandos = [
-                    ("clientes", """
-                    CREATE TABLE IF NOT EXISTS clientes (
-                        id SERIAL PRIMARY KEY,
-                        nome TEXT NOT NULL,
-                        telefone TEXT,
-                        endereco TEXT,
-                        observacoes TEXT,
-                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    );
-                    """),
-                    ("pets", """
-                    CREATE TABLE IF NOT EXISTS pets (
-                        id SERIAL PRIMARY KEY,
-                        cliente_id INTEGER NOT NULL,
-                        nome TEXT NOT NULL,
-                        especie TEXT,
-                        raca TEXT,
-                        porte TEXT,
-                        pelagem TEXT,
-                        data_nascimento TEXT,
-                        temperamento TEXT,
-                        alergias_restricoes TEXT,
-                        FOREIGN KEY (cliente_id) REFERENCES clientes(id)
-                    );
-                    """),
-                    ("servicos", """
-                    CREATE TABLE IF NOT EXISTS servicos (
-                        id SERIAL PRIMARY KEY,
-                        nome TEXT NOT NULL,
-                        preco_padrao REAL NOT NULL DEFAULT 0,
-                        duracao_minutos INTEGER NOT NULL DEFAULT 60
-                    );
-                    """),
-                    ("agendamentos", """
-                    CREATE TABLE IF NOT EXISTS agendamentos (
-                        id SERIAL PRIMARY KEY,
-                        pet_id INTEGER NOT NULL,
-                        servico_id INTEGER NOT NULL,
-                        data_hora TEXT NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'Agendado',
-                        profissional TEXT,
-                        valor_cobrado REAL,
-                        observacoes TEXT,
-                        rrule TEXT DEFAULT NULL,
-                        exdate TEXT DEFAULT NULL,
-                        pago INTEGER NOT NULL DEFAULT 0,
-                        data_pagamento TEXT DEFAULT NULL,
-                        FOREIGN KEY (pet_id) REFERENCES pets(id),
-                        FOREIGN KEY (servico_id) REFERENCES servicos(id)
-                    );
-                    """),
-                    ("financeiro", """
-                    CREATE TABLE IF NOT EXISTS financeiro (
-                        id SERIAL PRIMARY KEY,
-                        tipo TEXT NOT NULL,
-                        categoria TEXT,
-                        descricao TEXT,
-                        valor REAL NOT NULL,
-                        data TEXT NOT NULL,
-                        agendamento_id INTEGER,
-                        FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
-                    );
-                    """),
-                ]
-                for nome_tabela, cmd in comandos:
-                    try:
-                        print(f"[DATABASE LOG] Executando CREATE TABLE para '{nome_tabela}'...")
-                        conn.execute(cmd)
-                        print(f"[DATABASE LOG] Tabela '{nome_tabela}' criada ou já existente com sucesso.")
-                    except Exception as err:
-                        error_msg = f"[DATABASE ERROR] Erro ao criar tabela '{nome_tabela}' no Postgres: {err}"
-                        print(error_msg)
-                        if st is not None:
-                            try:
-                                st.error(error_msg)
-                            except Exception:
-                                pass
-                        raise err
-            else:
+            comandos = [
+                ("clientes", """
+                CREATE TABLE IF NOT EXISTS clientes (
+                    id SERIAL PRIMARY KEY,
+                    nome TEXT NOT NULL,
+                    telefone TEXT,
+                    endereco TEXT,
+                    observacoes TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """),
+                ("pets", """
+                CREATE TABLE IF NOT EXISTS pets (
+                    id SERIAL PRIMARY KEY,
+                    cliente_id INTEGER NOT NULL,
+                    nome TEXT NOT NULL,
+                    especie TEXT,
+                    raca TEXT,
+                    porte TEXT,
+                    pelagem TEXT,
+                    data_nascimento TEXT,
+                    temperamento TEXT,
+                    alergias_restricoes TEXT,
+                    FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+                );
+                """),
+                ("servicos", """
+                CREATE TABLE IF NOT EXISTS servicos (
+                    id SERIAL PRIMARY KEY,
+                    nome TEXT NOT NULL,
+                    preco_padrao REAL NOT NULL DEFAULT 0,
+                    duracao_minutos INTEGER NOT NULL DEFAULT 60
+                );
+                """),
+                ("agendamentos", """
+                CREATE TABLE IF NOT EXISTS agendamentos (
+                    id SERIAL PRIMARY KEY,
+                    pet_id INTEGER NOT NULL,
+                    servico_id INTEGER NOT NULL,
+                    data_hora TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'Agendado',
+                    profissional TEXT,
+                    valor_cobrado REAL,
+                    observacoes TEXT,
+                    rrule TEXT DEFAULT NULL,
+                    exdate TEXT DEFAULT NULL,
+                    pago INTEGER NOT NULL DEFAULT 0,
+                    data_pagamento TEXT DEFAULT NULL,
+                    FOREIGN KEY (pet_id) REFERENCES pets(id),
+                    FOREIGN KEY (servico_id) REFERENCES servicos(id)
+                );
+                """),
+                ("financeiro", """
+                CREATE TABLE IF NOT EXISTS financeiro (
+                    id SERIAL PRIMARY KEY,
+                    tipo TEXT NOT NULL,
+                    categoria TEXT,
+                    descricao TEXT,
+                    valor REAL NOT NULL,
+                    data TEXT NOT NULL,
+                    agendamento_id INTEGER,
+                    FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
+                );
+                """),
+            ]
+            for nome_tabela, cmd in comandos:
                 try:
-                    print("[DATABASE LOG] Executando script CREATE TABLE para SQLite...")
-                    conn.executescript(
-                        """
-                        CREATE TABLE IF NOT EXISTS clientes (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            nome TEXT NOT NULL,
-                            telefone TEXT,
-                            endereco TEXT,
-                            observacoes TEXT,
-                            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-                        );
-
-                        CREATE TABLE IF NOT EXISTS pets (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            cliente_id INTEGER NOT NULL,
-                            nome TEXT NOT NULL,
-                            especie TEXT,
-                            raca TEXT,
-                            porte TEXT,
-                            pelagem TEXT,
-                            data_nascimento TEXT,
-                            temperamento TEXT,
-                            alergias_restricoes TEXT,
-                            FOREIGN KEY (cliente_id) REFERENCES clientes(id)
-                        );
-
-                        CREATE TABLE IF NOT EXISTS servicos (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            nome TEXT NOT NULL,
-                            preco_padrao REAL NOT NULL DEFAULT 0,
-                            duracao_minutos INTEGER NOT NULL DEFAULT 60
-                        );
-
-                        CREATE TABLE IF NOT EXISTS agendamentos (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            pet_id INTEGER NOT NULL,
-                            servico_id INTEGER NOT NULL,
-                            data_hora TEXT NOT NULL,
-                            status TEXT NOT NULL DEFAULT 'Agendado',
-                            profissional TEXT,
-                            valor_cobrado REAL,
-                            observacoes TEXT,
-                            rrule TEXT DEFAULT NULL,
-                            exdate TEXT DEFAULT NULL,
-                            pago INTEGER NOT NULL DEFAULT 0,
-                            data_pagamento TEXT DEFAULT NULL,
-                            FOREIGN KEY (pet_id) REFERENCES pets(id),
-                            FOREIGN KEY (servico_id) REFERENCES servicos(id)
-                        );
-
-                        CREATE TABLE IF NOT EXISTS financeiro (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            tipo TEXT NOT NULL,
-                            categoria TEXT,
-                            descricao TEXT,
-                            valor REAL NOT NULL,
-                            data TEXT NOT NULL,
-                            agendamento_id INTEGER,
-                            FOREIGN KEY (agendamento_id) REFERENCES agendamentos(id)
-                        );
-                        """
-                    )
-                    print("[DATABASE LOG] Tabelas SQLite criadas ou já existentes com sucesso.")
+                    print(f"[DATABASE LOG] Executando CREATE TABLE para '{nome_tabela}'...")
+                    conn.execute(cmd)
+                    print(f"[DATABASE LOG] Tabela '{nome_tabela}' criada ou já existente com sucesso.")
                 except Exception as err:
-                    error_msg = f"[DATABASE ERROR] Erro ao criar tabelas no SQLite: {err}"
+                    error_msg = f"[DATABASE ERROR] Erro ao criar tabela '{nome_tabela}' no Postgres: {err}"
                     print(error_msg)
                     if st is not None:
                         try:
@@ -429,23 +321,10 @@ def init_db() -> None:
 def _migrate_db(conn: ConnectionWrapper) -> None:
     print("[DATABASE LOG] Verificando migrations do banco de dados...")
     try:
-        if conn.is_postgres:
-            conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS rrule TEXT DEFAULT NULL")
-            conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS exdate TEXT DEFAULT NULL")
-            conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS pago INTEGER NOT NULL DEFAULT 0")
-            conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS data_pagamento TEXT DEFAULT NULL")
-        else:
-            # SQLite
-            raw_cur = conn.conn.cursor()
-            columns = [row[1] for row in raw_cur.execute("PRAGMA table_info(agendamentos)").fetchall()]
-            if "rrule" not in columns:
-                conn.execute("ALTER TABLE agendamentos ADD COLUMN rrule TEXT DEFAULT NULL")
-            if "exdate" not in columns:
-                conn.execute("ALTER TABLE agendamentos ADD COLUMN exdate TEXT DEFAULT NULL")
-            if "pago" not in columns:
-                conn.execute("ALTER TABLE agendamentos ADD COLUMN pago INTEGER NOT NULL DEFAULT 0")
-            if "data_pagamento" not in columns:
-                conn.execute("ALTER TABLE agendamentos ADD COLUMN data_pagamento TEXT DEFAULT NULL")
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS rrule TEXT DEFAULT NULL")
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS exdate TEXT DEFAULT NULL")
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS pago INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS data_pagamento TEXT DEFAULT NULL")
         print("[DATABASE LOG] Migrations concluídas com sucesso.")
     except Exception as err:
         msg = f"[DATABASE ERROR] Erro durante migrations (_migrate_db): {err}"
@@ -559,9 +438,7 @@ def salvar_cliente(
             (nome.strip(), telefone.strip(), endereco.strip(), observacoes.strip()),
         )
         res = cur.fetchone()
-        if res and "id" in res:
-            return int(res["id"])
-        return int(cur.lastrowid)
+        return int(res["id"])
 
 
 def excluir_cliente(cliente_id: int) -> None:
@@ -677,9 +554,7 @@ def salvar_pet(
             ),
         )
         res = cur.fetchone()
-        if res and "id" in res:
-            return int(res["id"])
-        return int(cur.lastrowid)
+        return int(res["id"])
 
 
 def excluir_pet(pet_id: int) -> None:
@@ -705,32 +580,18 @@ def prontuario_pet(pet_id: int) -> list[dict[str, Any]]:
 def aniversariantes_do_dia(dia: date) -> list[dict[str, Any]]:
     chave = dia.strftime("%m-%d")
     with get_connection() as conn:
-        if conn.is_postgres:
-            rows = conn.execute(
-                """
-                SELECT p.*, c.nome AS tutor_nome, c.telefone AS tutor_telefone
-                FROM pets p
-                JOIN clientes c ON c.id = p.cliente_id
-                WHERE p.data_nascimento IS NOT NULL
-                  AND p.data_nascimento != ''
-                  AND TO_CHAR(TO_DATE(p.data_nascimento, 'YYYY-MM-DD'), 'MM-DD') = %s
-                ORDER BY p.nome
-                """,
-                (chave,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT p.*, c.nome AS tutor_nome, c.telefone AS tutor_telefone
-                FROM pets p
-                JOIN clientes c ON c.id = p.cliente_id
-                WHERE p.data_nascimento IS NOT NULL
-                  AND p.data_nascimento != ''
-                  AND strftime('%m-%d', p.data_nascimento) = %s
-                ORDER BY p.nome
-                """,
-                (chave,),
-            ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT p.*, c.nome AS tutor_nome, c.telefone AS tutor_telefone
+            FROM pets p
+            JOIN clientes c ON c.id = p.cliente_id
+            WHERE p.data_nascimento IS NOT NULL
+              AND p.data_nascimento != ''
+              AND TO_CHAR(TO_DATE(p.data_nascimento, 'YYYY-MM-DD'), 'MM-DD') = %s
+            ORDER BY p.nome
+            """,
+            (chave,),
+        ).fetchall()
     return _as_dicts(rows)
 
 
@@ -780,9 +641,7 @@ def salvar_servico(
             (nome.strip(), float(preco_padrao), int(duracao_minutos)),
         )
         res = cur.fetchone()
-        if res and "id" in res:
-            return int(res["id"])
-        return int(cur.lastrowid)
+        return int(res["id"])
 
 
 def excluir_servico(servico_id: int) -> tuple[bool, str]:
@@ -965,10 +824,7 @@ def salvar_agendamento(
                 ),
             )
             res = cur.fetchone()
-            if res and "id" in res:
-                novo_id = int(res["id"])
-            else:
-                novo_id = int(cur.lastrowid)
+            novo_id = int(res["id"])
 
     _sincronizar_receita_agendamento(novo_id)
     return novo_id
@@ -1114,9 +970,7 @@ def salvar_lancamento(
             (tipo, categoria, descricao.strip(), valor, dia),
         )
         res = cur.fetchone()
-        if res and "id" in res:
-            return int(res["id"])
-        return int(cur.lastrowid)
+        return int(res["id"])
 
 
 def excluir_lancamento(lancamento_id: int) -> None:
@@ -1207,28 +1061,16 @@ def faturamento_semanal(inicio: date, fim: date) -> list[dict[str, Any]]:
 
 def faturamento_mensal(ano: int) -> list[dict[str, Any]]:
     with get_connection() as conn:
-        if conn.is_postgres:
-            rows = conn.execute(
-                """
-                SELECT SUBSTRING(data FROM 1 FOR 7) AS mes, SUM(valor) AS total
-                FROM financeiro
-                WHERE tipo = 'Receita' AND SUBSTRING(data FROM 1 FOR 4) = %s
-                GROUP BY mes
-                ORDER BY mes
-                """,
-                (str(ano),),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT substr(data, 1, 7) AS mes, SUM(valor) AS total
-                FROM financeiro
-                WHERE tipo = 'Receita' AND substr(data, 1, 4) = %s
-                GROUP BY mes
-                ORDER BY mes
-                """,
-                (str(ano),),
-            ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT SUBSTRING(data FROM 1 FOR 7) AS mes, SUM(valor) AS total
+            FROM financeiro
+            WHERE tipo = 'Receita' AND SUBSTRING(data FROM 1 FOR 4) = %s
+            GROUP BY mes
+            ORDER BY mes
+            """,
+            (str(ano),),
+        ).fetchall()
     mapa = {str(row["mes"]): float(row["total"]) for row in rows}
     return [
         {"mes": f"{ano}-{mes:02d}", "total": mapa.get(f"{ano}-{mes:02d}", 0.0)}
